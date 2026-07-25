@@ -1,0 +1,38 @@
+# --- OS / editor cruft ---
+.DS_Store
+**/.DS_Store
+*.log
+
+# --- Secrets: never commit real env files (any level) ---
+.env
+.env.local
+.env.test
+.env.*.local
+**/.env
+**/.env.local
+**/.env.test
+**/.env.*.local
+*_recovery_code.txt
+**/tools/ads/google-ads.yaml
+
+# --- Dependencies ---
+node_modules/
+**/node_modules/
+
+# --- Local databases ---
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+local.db*
+test.db*
+
+# --- Build / deploy ---
+.vercel/
+**/.vercel/
+tmp/
+**/tmp/
+
+# --- Local Claude config ---
+.claude/
+**/.claude/

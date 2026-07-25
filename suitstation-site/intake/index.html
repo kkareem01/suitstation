@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <title>Customer Intake · Suit Station</title>
+  <meta name="description" content="In-store customer intake form for tailoring." />
+  <meta name="robots" content="noindex,nofollow" />
+
+  <link rel="manifest" href="/intake/manifest.webmanifest" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Intake" />
+  <meta name="theme-color" content="#14213D" />
+  <link rel="apple-touch-icon" href="/assets/img/favicon.png" />
+  <link rel="icon" type="image/png" href="/assets/img/favicon.png" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant Garamond:wght@400;500;600&family=Lora:wght@400;700&display=optional" rel="stylesheet" />
+  <link rel="stylesheet" href="/assets/css/styles.css" />
+  <link rel="stylesheet" href="/assets/css/intake.css" />
+</head>
+<body class="intake-body">
+  <main class="intake-main" id="intake-root">
+
+    <!-- Form state -->
+    <section class="intake-stage" data-stage="form" aria-hidden="false">
+      <header class="intake-header">
+        <div class="intake-eyebrow">Suit Station</div>
+        <h1 class="intake-title">Let's tailor your suit</h1>
+      </header>
+
+      <div class="booking-card" id="intake-card" data-step="1">
+        <div class="booking-card__body">
+          <div class="booking-pane">
+
+            <div class="booking-error" id="intake-error" role="alert" hidden></div>
+
+            <!-- Stage 1: customer fills their own info -->
+            <section class="intake-region" data-region="customer">
+              <h2>Just the basics</h2>
+              <p class="booking-pane__sub">A few quick details and you're done.</p>
+
+              <form id="intake-customer-form" class="booking-form" novalidate autocomplete="off">
+                <div class="field">
+                  <label for="bk-phone">Phone</label>
+                  <div class="booking-form__phone-row">
+                    <span class="booking-form__country" aria-label="United States">+1</span>
+                    <input id="bk-phone" type="tel" name="phone" required
+                      data-action="phone-input" inputmode="none" autocomplete="off"
+                      maxlength="14" placeholder="(404) 555-0123" />
+                  </div>
+
+                  <!-- Custom on-screen number pad. iPadOS has no compact dial
+                       pad for web inputs, so inputmode="none" above suppresses
+                       the device keyboard for this field and this 10-key pad
+                       takes over. Shown on focus / hidden on blur — wired up in
+                       assets/js/intake-form.js. -->
+                  <div class="numpad" id="bk-numpad" role="group"
+                    aria-label="Phone number keypad" hidden>
+                    <button type="button" class="numpad__key" data-key="1">1</button>
+                    <button type="button" class="numpad__key" data-key="2">2</button>
+                    <button type="button" class="numpad__key" data-key="3">3</button>
+                    <button type="button" class="numpad__key" data-key="4">4</button>
+                    <button type="button" class="numpad__key" data-key="5">5</button>
+                    <button type="button" class="numpad__key" data-key="6">6</button>
+                    <button type="button" class="numpad__key" data-key="7">7</button>
+                    <button type="button" class="numpad__key" data-key="8">8</button>
+                    <button type="button" class="numpad__key" data-key="9">9</button>
+                    <button type="button" class="numpad__key numpad__key--util"
+                      data-key="back" aria-label="Delete last digit">⌫</button>
+                    <button type="button" class="numpad__key" data-key="0">0</button>
+                    <button type="button" class="numpad__key numpad__key--done"
+                      data-key="done">Done</button>
+                  </div>
+                </div>
+
+                <div class="booking-form__row">
+                  <div class="field">
+                    <label for="bk-first">First name</label>
+                    <input id="bk-first" type="text" name="firstName" required
+                      placeholder="First name *" autocomplete="given-name"
+                      autocapitalize="words" maxlength="60" />
+                  </div>
+                  <div class="field">
+                    <label for="bk-last">Last name</label>
+                    <input id="bk-last" type="text" name="lastName" required
+                      placeholder="Last name *" autocomplete="family-name"
+                      autocapitalize="words" maxlength="60" />
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label for="bk-email">Email</label>
+                  <input id="bk-email" type="email" name="email" required
+                    placeholder="you@example.com" autocomplete="email"
+                    inputmode="email" maxlength="254" />
+                </div>
+
+                <input type="text" name="hp" class="booking-form__honeypot"
+                  tabindex="-1" autocomplete="off" aria-hidden="true" />
+
+                <div class="field" style="margin-top:2px;">
+                  <label for="bk-sms-consent" style="display:flex;align-items:flex-start;gap:12px;cursor:pointer;font-family:var(--font-body,'Lora',Georgia,serif);font-size:13px;line-height:1.55;color:#5b5b5b;">
+                    <input type="checkbox" id="bk-sms-consent" name="smsConsent" required
+                      style="flex:0 0 auto;width:22px;height:22px;margin:1px 0 0;accent-color:#14213D;" />
+                    <span>By providing your phone number, you agree to receive a one-time SMS from Suit Station when your tailoring is ready for pickup. Message frequency: approximately 1 message per tailoring visit. Message &amp; data rates may apply. Reply STOP to opt out at any time, or HELP for help. See our <a href="/privacy" target="_blank" rel="noopener" style="color:#14213D;">Privacy Policy</a> and <a href="/terms" target="_blank" rel="noopener" style="color:#14213D;">Terms</a>.</span>
+                  </label>
+                </div>
+
+                <button type="submit" class="btn btn-primary" id="intake-customer-done" disabled>
+                  I'm done →
+                </button>
+                <noscript>
+                  <p class="intake-hint" style="text-align:center;margin-top:16px;">JavaScript must be enabled.</p>
+                </noscript>
+              </form>
+            </section>
+
+            <!-- Stage 2: handoff screen -->
+            <section class="intake-region" data-region="handoff" hidden>
+              <div class="intake-handoff">
+                <h2 class="intake-handoff__title">Thanks, <span data-bind="firstName">there</span>!</h2>
+                <p class="intake-handoff__sub">Return the iPad to a team member.</p>
+                <button type="button" class="intake-handoff__continue" id="intake-handoff-continue">
+                  Continue
+                </button>
+              </div>
+            </section>
+
+            <!-- Stage 3: staff fills the technical details -->
+            <section class="intake-region" data-region="staff" hidden>
+              <div class="intake-staff__topbar">
+                <button type="button" class="intake-back" id="intake-back">← Go back</button>
+                <div class="intake-customer-chip">
+                  <span data-bind="customerSummary">—</span>
+                </div>
+              </div>
+
+              <h2>Tailoring details</h2>
+
+              <form id="intake-staff-form" class="booking-form" novalidate autocomplete="off">
+                <div class="field intake-chips-field">
+                  <label>What needs tailoring? <span class="intake-label-hint">(tap all that apply)</span></label>
+                  <div class="intake-chips" role="group" aria-label="Tailoring needs">
+                    <button type="button" class="intake-chip" data-item="Hem">Hem</button>
+                    <button type="button" class="intake-chip" data-item="Waist">Waist</button>
+                    <button type="button" class="intake-chip" data-item="Sleeves">Sleeves</button>
+                    <button type="button" class="intake-chip" data-item="Shirt">Shirt</button>
+                    <button type="button" class="intake-chip" data-item="Jacket">Jacket</button>
+                    <button type="button" class="intake-chip" data-item="Vest">Vest</button>
+                    <button type="button" class="intake-chip" data-item="Slim Pants">Slim Pants</button>
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label for="bk-needby">Need it by</label>
+                  <input id="bk-needby" type="date" name="needByDate" required />
+                </div>
+
+                <div class="field">
+                  <label for="bk-ticket">Ticket number <span class="intake-label-hint">(optional)</span></label>
+                  <input id="bk-ticket" type="text" name="ticketNumber" maxlength="32"
+                    inputmode="numeric" autocomplete="off" placeholder="Ticket #" />
+                </div>
+
+                <div class="field">
+                  <label for="bk-notes">Additional notes <span class="intake-label-hint">(optional)</span></label>
+                  <textarea id="bk-notes" name="additionalNotes" rows="3" maxlength="500"></textarea>
+                </div>
+
+                <button type="submit" class="btn btn-primary" id="intake-submit">Save intake ›</button>
+              </form>
+            </section>
+
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Submitting state -->
+    <section class="intake-stage" data-stage="submitting" aria-hidden="true" hidden>
+      <div class="intake-loading">
+        <div class="intake-spinner" aria-hidden="true"></div>
+        <p>Saving…</p>
+      </div>
+    </section>
+
+    <!-- Confirmed state -->
+    <section class="intake-stage" data-stage="confirmed" aria-hidden="true" hidden>
+      <div class="intake-confirmed">
+        <div class="intake-check" aria-hidden="true">
+          <svg viewBox="0 0 64 64" width="72" height="72" role="presentation">
+            <circle cx="32" cy="32" r="30" fill="none" stroke="currentColor" stroke-width="3" />
+            <path d="M18 33 L29 44 L47 22" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </div>
+        <h2 class="intake-confirmed-title">Saved — thanks!</h2>
+        <p class="intake-confirmed-sub">
+          Intake saved. We'll be in touch before <span data-bind="needByDate">your date</span> if anything's needed.
+        </p>
+        <button type="button" class="btn btn-primary" id="intake-reset">All done</button>
+      </div>
+    </section>
+  </main>
+
+  <script defer src="/assets/js/intake-form.js"></script>
+</body>
+</html>

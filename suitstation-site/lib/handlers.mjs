@@ -1,0 +1,1688 @@
+/**
+ * API handlers used by BOTH the Vercel serverless functions in /api/*
+ * AND the local dev server in server.mjs.
+ *
+ * Each handler accepts (req, res). On Vercel, req.body is auto-parsed for JSON
+ * by the Node runtime. For the local server, server.mjs parses the body and
+ * attaches it to req.body before invoking these handlers, so the calling
+ * convention is identical.
+ */
+
+import { readFile } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { isValidAudience } from './audiences.mjs';
+import { ensureBootstrapped } from './db.mjs';
+import {
+  validateBookingPayload,
+  validateLeadPayload,
+  validateLeadMagnetPayload,
+  validateIntakePayload,
+  validateName,
+  validatePhone,
+  validateEmail,
+  validateDateString,
+  validateTimeString,
+  validateAttribution,
+} from './validate.mjs';
+import {
+  generateSlotsForDate,
+  filterAvailableSlots,
+  listMonth,
+} from './slots.mjs';
+import {
+  findBookingById,
+  listBookingsBySlot,
+  listBookingsByMonth,
+  createBooking,
+  createLead,
+  findLeadById,
+  updateBookingEmailStatus,
+  listBookings,
+  countNewBookings,
+  updateBookingStaffStatus,
+  updateBookingFields,
+  deleteBooking,
+  createIntake,
+  listIntakes,
+  updateIntakeTailorStatus,
+  updateIntakeFields,
+  deleteIntake,
+  findIntakeById,
+  markIntakePickupNoticeSent,
+} from './store.mjs';
+import {
+  createSpecialOrder,
+  listSpecialOrders,
+  findSpecialOrderById,
+  updateSpecialOrderStatus,
+  updateSpecialOrderFields,
+  deleteSpecialOrder,
+  markSpecialOrderArrivalNoticeSent,
+  VALID_ORDER_STATUSES,
+  VALID_ITEM_TYPES,
+} from './special-orders-store.mjs';
+import { sendPickupReadyNotification } from './notify-pickup.mjs';
+import { sendSpecialOrderArrivedNotification } from './notify-special-order.mjs';
+import {
+  getActiveOffer,
+  findOfferById,
+  reserveOfferSlot,
+  releaseOfferSlot,
+  insertRedemptionCode,
+  issueCodeForBooking,
+  findUnredeemedCodeForOffer,
+  hasEverRedeemedSameItem,
+} from './offers.mjs';
+import { generateCode, signLeadToken, verifyLeadToken, isoDaysFromNow } from './codes.mjs';
+import {
+  runNurtureT3,
+  runNurtureT1,
+  runNurtureDayOf,
+  runExpireCodes,
+  runRotateOffer,
+  runSyncAdSpend,
+} from './cron.mjs';
+import { lookupCode, redeemCode, getFunnelStats } from './admin.mjs';
+import { isStaffAuthed } from './staff-auth.mjs';
+import { newBookingId, newLeadId, newIntakeId, newSpecialOrderId } from './id.mjs';
+import { buildICS } from './ics.mjs';
+import {
+  sendEmail,
+  customerConfirmationEmail,
+  ownerNotificationEmail,
+  redemptionCodeEmail,
+  giftCodeReadyEmail,
+} from './email.mjs';
+import { notifyOwnerOfBooking } from './notify-owner-booking.mjs';
+import * as log from './log.mjs';
+
+// --- config (cached per cold-start) -----------------------------------------
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+let cachedConfig = null;
+
+async function loadConfig() {
+  if (cachedConfig) return cachedConfig;
+  const raw = await readFile(join(ROOT, 'data/config.json'), 'utf8');
+  cachedConfig = JSON.parse(raw);
+  return cachedConfig;
+}
+
+function publicConfig(cfg) {
+  return {
+    storeTimezone: cfg.storeTimezone,
+    businessHours: cfg.businessHours,
+    blackoutDates: cfg.blackoutDates,
+    defaultSlotDurationMinutes: cfg.defaultSlotDurationMinutes,
+    fittingTypes: cfg.fittingTypes,
+    urgencyTimerSeconds: cfg.urgencyTimerSeconds,
+    leadTimeMinutes: cfg.leadTimeMinutes,
+    maxAdvanceDays: cfg.maxAdvanceDays,
+  };
+}
+
+// --- helpers ----------------------------------------------------------------
+
+function clientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length > 0) return fwd.split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  res.end(JSON.stringify(body));
+}
+
+function ok(data) {
+  return { ok: true, data };
+}
+
+function err(message, code) {
+  return { ok: false, error: message, code: code ?? null };
+}
+
+function getUrl(req) {
+  return new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+}
+
+// --- rate limit (per-instance, in-memory) -----------------------------------
+// On Vercel each warm instance has its own map; cold starts reset it. For a
+// small business that's an acceptable trade-off vs. paying for a KV store.
+const RATE_LIMITS = new Map();
+const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const cur = RATE_LIMITS.get(ip);
+  if (!cur || cur.resetAt < now) {
+    RATE_LIMITS.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  if (cur.count >= RATE_LIMIT_MAX) return false;
+  cur.count += 1;
+  return true;
+}
+
+// Intake submissions all come from the in-store iPad (one IP, many customers
+// per hour during busy times), so the bucket is much larger than the booking
+// limit while still blocking abusive bots.
+const INTAKE_RATE_LIMITS = new Map();
+const INTAKE_RATE_LIMIT_MAX = 60;
+const INTAKE_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+
+function checkIntakeRateLimit(ip) {
+  const now = Date.now();
+  const cur = INTAKE_RATE_LIMITS.get(ip);
+  if (!cur || cur.resetAt < now) {
+    INTAKE_RATE_LIMITS.set(ip, { count: 1, resetAt: now + INTAKE_RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  if (cur.count >= INTAKE_RATE_LIMIT_MAX) return false;
+  cur.count += 1;
+  return true;
+}
+
+// --- handlers ---------------------------------------------------------------
+
+export async function handleConfig(req, res) {
+  const cfg = await loadConfig();
+  sendJson(res, 200, ok(publicConfig(cfg)));
+}
+
+const PLACES_ENDPOINT = 'https://places.googleapis.com/v1/places';
+
+export async function handleGoogleRating(req, res) {
+  const placeId = process.env.GOOGLE_PLACE_ID;
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+
+  const writeJson = (status, body, cacheControl) => {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': cacheControl || 'no-store',
+    });
+    res.end(JSON.stringify(body));
+  };
+
+  if (!placeId || !apiKey) return writeJson(503, { error: 'Not configured' });
+
+  try {
+    const upstream = await fetch(`${PLACES_ENDPOINT}/${encodeURIComponent(placeId)}`, {
+      headers: { 'X-Goog-Api-Key': apiKey, 'X-Goog-FieldMask': 'rating' },
+    });
+    if (!upstream.ok) return writeJson(502, { error: 'Upstream error', status: upstream.status });
+    const data = await upstream.json();
+    const rating = typeof data.rating === 'number' ? data.rating : null;
+    writeJson(200, { rating }, 'public, s-maxage=21600, stale-while-revalidate=86400');
+  } catch {
+    writeJson(500, { error: 'Internal error' });
+  }
+}
+
+export async function handleAvailability(req, res) {
+  const url = getUrl(req);
+  const date = url.searchParams.get('date');
+  const audience = url.searchParams.get('audience');
+  if (!date || !isValidAudience(audience)) {
+    return sendJson(res, 400, err('Missing or invalid date / audience.'));
+  }
+  const cfg = await loadConfig();
+  const all = generateSlotsForDate(date, cfg, audience);
+  const booked = await listBookingsBySlot(date, audience);
+  const bookedTimes = new Set(booked.map((b) => b.slot.time));
+  const available = filterAvailableSlots(all, bookedTimes, date, cfg);
+  const slots = all.map((time) => ({ time, available: available.includes(time) }));
+  sendJson(res, 200, ok({ date, audience, slots }));
+}
+
+export async function handleAvailabilityMonth(req, res) {
+  const url = getUrl(req);
+  const year = parseInt(url.searchParams.get('year') || '', 10);
+  const month = parseInt(url.searchParams.get('month') || '', 10);
+  const audience = url.searchParams.get('audience');
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12 || !isValidAudience(audience)) {
+    return sendJson(res, 400, err('Missing or invalid year / month / audience.'));
+  }
+  const cfg = await loadConfig();
+  const all = await listBookingsByMonth(year, month, audience);
+  const map = new Map();
+  for (const b of all) {
+    if (!map.has(b.slot.date)) map.set(b.slot.date, new Set());
+    map.get(b.slot.date).add(b.slot.time);
+  }
+  const days = listMonth(year, month, cfg, audience, map);
+  sendJson(res, 200, ok({ year, month, audience, days }));
+}
+
+export async function handleCreateLead(req, res) {
+  const body = req.body || {};
+  const v = validateLeadPayload(body);
+  if (!v.ok) return sendJson(res, 400, err(v.errors.join(' ')));
+
+  const ip = clientIp(req);
+  const userAgent = (req.headers['user-agent'] || '').slice(0, 200);
+  const attribution = validateAttribution(body.attribution);
+
+  const result = await createLead(
+    {
+      audience: v.value.audience,
+      firstName: v.value.firstName,
+      lastName: v.value.lastName,
+      phone: v.value.phone,
+      consent: v.value.consent,
+      ip,
+      userAgent,
+      ...(attribution || {}),
+    },
+    newLeadId
+  );
+
+  if (!result.ok) return sendJson(res, 500, err('Could not save lead.'));
+  log.info(`lead captured ${result.lead.id} audience=${v.value.audience}`);
+  sendJson(res, 200, ok({ leadId: result.lead.id }));
+}
+
+export async function handleCreateBooking(req, res) {
+  const ip = clientIp(req);
+  if (!checkRateLimit(ip)) {
+    return sendJson(res, 429, err('Too many bookings from your network. Try again later.'));
+  }
+
+  const body = req.body || {};
+  const v = validateBookingPayload(body);
+  if (!v.ok) return sendJson(res, 400, err(v.errors.join(' ')));
+
+  const cfg = await loadConfig();
+  const audience = v.value.audience;
+  const fitting = cfg.fittingTypes[audience];
+  const durationMinutes = fitting?.slotDurationMinutes ?? cfg.defaultSlotDurationMinutes ?? 20;
+
+  const allSlots = generateSlotsForDate(v.value.slot.date, cfg, audience);
+  if (!allSlots.includes(v.value.slot.time)) {
+    return sendJson(res, 409, err('That slot is no longer available.', 'SLOT_TAKEN'));
+  }
+  const taken = await listBookingsBySlot(v.value.slot.date, audience);
+  const open = filterAvailableSlots(allSlots, new Set(taken.map((b) => b.slot.time)), v.value.slot.date, cfg);
+  if (!open.includes(v.value.slot.time)) {
+    return sendJson(res, 409, err('That slot is no longer available.', 'SLOT_TAKEN'));
+  }
+
+  const record = {
+    audience,
+    customer: v.value.customer,
+    answers: v.value.answers,
+    slot: {
+      date: v.value.slot.date,
+      time: v.value.slot.time,
+      durationMinutes,
+      tz: cfg.storeTimezone,
+    },
+    displayTimezone: v.value.timezone,
+    consent: true,
+    leadId: typeof body.leadId === 'string' ? body.leadId : null,
+    ip,
+    userAgent: (req.headers['user-agent'] || '').slice(0, 200),
+    emailStatus: 'pending',
+    ...(validateAttribution(body.attribution) || {}),
+  };
+
+  const result = await createBooking(record, newBookingId);
+  if (!result.ok) {
+    if (result.error === 'SLOT_TAKEN') {
+      return sendJson(res, 409, err('That slot is no longer available.', 'SLOT_TAKEN'));
+    }
+    return sendJson(res, 500, err('Could not save booking.'));
+  }
+
+  log.info(`booking created ${result.booking.id} ${audience} ${v.value.slot.date} ${v.value.slot.time}`);
+
+  // If the booker came in via a lead-magnet opt-in (and supplied a valid HMAC),
+  // try to flip their reserved code to issued + bind it to the booking.
+  let issuedCode = null;
+  let issuedOffer = null;
+  const leadId = result.booking.leadId;
+  const leadToken = typeof body.t === 'string' ? body.t : null;
+  if (leadId && leadToken && verifyLeadToken(leadId, leadToken)) {
+    try {
+      const codeRow = await issueCodeForBooking(leadId, result.booking.id);
+      if (codeRow) {
+        issuedCode = codeRow;
+        issuedOffer = await findOfferById(codeRow.offerId);
+      }
+    } catch (e) {
+      log.warn(`could not issue code for booking ${result.booking.id}: ${e?.message || e}`);
+    }
+  }
+
+  // Awaited in serverless so the function doesn't terminate before email finishes.
+  // The owner SMS rides alongside rather than inside fireEmails: it must not be
+  // able to flip the booking's email_status, and a Twilio failure must not stop
+  // the customer's confirmation from going out.
+  const audienceLabel = cfg.fittingTypes?.[result.booking.audience]?.label || result.booking.audience;
+  await Promise.all([
+    fireEmails(result.booking, cfg, issuedCode, issuedOffer)
+      .catch((e) => log.error('email pipeline crash', e?.message || e)),
+    notifyOwnerOfBooking(result.booking, audienceLabel),
+  ]);
+
+  return sendJson(res, 200, ok({
+    id: result.booking.id,
+    slot: result.booking.slot,
+    customer: result.booking.customer,
+    redemption: issuedCode && issuedOffer ? {
+      code: issuedCode.code,
+      expiresAt: issuedCode.expiresAt,
+      offer: { name: issuedOffer.name, itemDescription: issuedOffer.itemDescription },
+    } : null,
+  }));
+}
+
+export async function handleCreateIntake(req, res) {
+  const ip = clientIp(req);
+  if (!checkIntakeRateLimit(ip)) {
+    return sendJson(res, 429, err('Too many submissions from this device. Try again in a bit.'));
+  }
+
+  await ensureBootstrapped();
+
+  const body = req.body || {};
+  const v = validateIntakePayload(body);
+  if (!v.ok) {
+    if (v.code === 'HONEYPOT' || v.code === 'TOO_FAST') {
+      // Look like a normal success to bots — don't tell them why we rejected.
+      return sendJson(res, 200, ok({ id: null }));
+    }
+    return sendJson(res, 400, err(v.errors.join(' ')));
+  }
+
+  const userAgent = (req.headers['user-agent'] || '').slice(0, 200);
+  const result = await createIntake(
+    {
+      firstName: v.value.firstName,
+      lastName: v.value.lastName,
+      phone: v.value.phone,
+      email: v.value.email,
+      suitSize: v.value.suitSize,
+      suitColor: v.value.suitColor,
+      ticketNumber: v.value.ticketNumber,
+      tailoringNotes: v.value.tailoringNotes,
+      additionalNotes: v.value.additionalNotes,
+      needByDate: v.value.needByDate,
+      ip,
+      userAgent,
+    },
+    newIntakeId
+  );
+
+  if (!result.ok) return sendJson(res, 500, err('Could not save customer.'));
+  log.info(`intake created ${result.intake.id} need-by=${v.value.needByDate}`);
+
+  return sendJson(res, 200, ok({ id: result.intake.id }));
+}
+
+async function fireEmails(booking, cfg, issuedCode = null, issuedOffer = null) {
+  const businessName = process.env.BUSINESS_NAME || 'Suit Station';
+  const businessAddress = process.env.BUSINESS_ADDRESS || '150 Pearl Nix Pkwy, Gainesville GA 30501';
+  const businessPhone = process.env.BUSINESS_PHONE || '+14705957775';
+  const fromEmail = process.env.FROM_EMAIL || 'bookings@example.com';
+  const ownerEmail = process.env.OWNER_EMAIL;
+  const siteUrl = process.env.SITE_URL || 'https://www.suitstation.us';
+  const audienceLabel = cfg.fittingTypes?.[booking.audience]?.label || booking.audience;
+  const confirmUrl = `${siteUrl}/booking-confirmed.html?id=${booking.id}`;
+
+  // Friendly From: "Suit Station <tie@suitstation.us>" lands better
+  // in Gmail's primary tab than a bare address.
+  const fromHeader = `${businessName} <${fromEmail}>`;
+
+  const ics = buildICS({
+    id: booking.id,
+    slot: booking.slot,
+    durationMinutes: booking.slot.durationMinutes,
+    tz: booking.slot.tz,
+    summary: issuedOffer ? `Pickup: ${issuedOffer.name} at ${businessName}` : `${audienceLabel} at ${businessName}`,
+    description: issuedOffer
+      ? `Pick up your free ${issuedOffer.name} at ${businessName}. Reference: ${booking.id}.\n${confirmUrl}`
+      : `Your fitting at ${businessName}. Reference: ${booking.id}.\n${confirmUrl}`,
+    location: businessAddress,
+  });
+
+  const customer = issuedCode && issuedOffer
+    ? redemptionCodeEmail({
+        booking,
+        offer: issuedOffer,
+        code: issuedCode.code,
+        expiresAt: issuedCode.expiresAt,
+        businessName,
+        businessAddress,
+        businessPhone,
+        confirmUrl,
+      })
+    : customerConfirmationEmail({
+        booking, businessName, businessAddress, businessPhone, confirmUrl,
+      });
+  const ownerSubjectPrefix = issuedOffer ? `[GIFT: ${issuedOffer.name}] ` : '';
+  const owner = ownerNotificationEmail({ booking, audienceLabel, businessName });
+  if (ownerSubjectPrefix) owner.subject = ownerSubjectPrefix + owner.subject;
+
+  // List-Unsubscribe headers signal Gmail/Outlook that this is a legitimate
+  // sender that respects opt-out — strong deliverability signal even though
+  // the email is transactional and the customer just opted in.
+  const unsubscribeHeaders = ownerEmail ? {
+    'List-Unsubscribe': `<mailto:${ownerEmail}?subject=unsubscribe>`,
+    'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+  } : undefined;
+
+  const sends = [
+    sendEmail({
+      to: booking.customer.email,
+      from: fromHeader,
+      replyTo: ownerEmail,
+      subject: customer.subject,
+      html: customer.html,
+      text: customer.text,
+      headers: unsubscribeHeaders,
+      attachments: [{ filename: 'fitting.ics', content: ics, contentType: 'text/calendar' }],
+    }),
+  ];
+  if (ownerEmail) {
+    sends.push(
+      sendEmail({
+        to: ownerEmail,
+        from: fromHeader,
+        replyTo: booking.customer.email,
+        subject: owner.subject,
+        html: owner.html,
+        text: owner.text,
+      })
+    );
+  }
+
+  const results = await Promise.allSettled(sends);
+  const failures = results.filter((r) => r.status === 'rejected' || (r.status === 'fulfilled' && !r.value.ok));
+  const status = failures.length === 0 ? 'sent' : failures.length === results.length ? 'failed' : 'partial';
+  const detail = failures
+    .map((r) => (r.status === 'rejected' ? r.reason?.message : r.value?.error))
+    .filter(Boolean)
+    .join(' | ');
+  await updateBookingEmailStatus(booking.id, status, detail || null).catch(() => {});
+  if (status !== 'sent') log.warn(`booking ${booking.id} email status=${status} detail=${detail}`);
+}
+
+/**
+ * Re-send the redemption-code email to a customer resuming an existing gift
+ * claim (their original email never arrived). Customer-only — no owner
+ * re-notification. Uses the booking-aware email when an appointment exists,
+ * otherwise the standalone gift-code email.
+ */
+async function resendRedemptionCodeEmail({ codeRow, offer, booking, firstName, toEmail }) {
+  const businessName = process.env.BUSINESS_NAME || 'Suit Station';
+  const businessAddress = process.env.BUSINESS_ADDRESS || '150 Pearl Nix Pkwy, Gainesville GA 30501';
+  const businessPhone = process.env.BUSINESS_PHONE || '+14705957775';
+  const fromEmail = process.env.FROM_EMAIL || 'bookings@example.com';
+  const ownerEmail = process.env.OWNER_EMAIL;
+  const siteUrl = process.env.SITE_URL || 'https://www.suitstation.us';
+  const fromHeader = `${businessName} <${fromEmail}>`;
+
+  const email = booking
+    ? redemptionCodeEmail({
+        booking,
+        offer,
+        code: codeRow.code,
+        expiresAt: codeRow.expiresAt,
+        businessName,
+        businessAddress,
+        businessPhone,
+        confirmUrl: `${siteUrl}/booking-confirmed.html?id=${booking.id}`,
+      })
+    : giftCodeReadyEmail({
+        firstName: firstName || 'there',
+        offer,
+        code: codeRow.code,
+        expiresAt: codeRow.expiresAt,
+        businessName,
+        businessAddress,
+        businessPhone,
+      });
+
+  return sendEmail({
+    to: toEmail,
+    from: fromHeader,
+    replyTo: ownerEmail,
+    subject: email.subject,
+    html: email.html,
+    text: email.text,
+  });
+}
+
+export async function handleGetBooking(req, res, id) {
+  if (!id || !/^BK-[A-F0-9]+$/i.test(id)) return sendJson(res, 400, err('Invalid booking id.'));
+  const b = await findBookingById(id);
+  if (!b) return sendJson(res, 404, err('Booking not found.'));
+  sendJson(res, 200, ok({
+    id: b.id,
+    audience: b.audience,
+    slot: b.slot,
+    displayTimezone: b.displayTimezone,
+    customer: { firstName: b.customer.firstName, email: b.customer.email },
+    createdAt: b.createdAt,
+  }));
+}
+
+// ============================================================================
+// Lead magnet
+// ============================================================================
+
+const QUALIFIER_TO_AUDIENCE = {
+  event: 'general',
+  wardrobe: 'general',
+  maybe: 'general',
+};
+
+export async function handleGetActiveOffer(req, res) {
+  try {
+    await ensureBootstrapped();
+    const offer = await getActiveOffer();
+    if (!offer) {
+      res.writeHead(404, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'public, max-age=60',
+      });
+      return res.end(JSON.stringify({ ok: false, error: 'NO_ACTIVE_OFFER' }));
+    }
+    const remainingRaw = offer.redemptionCap - offer.redemptionsUsed;
+    const remaining = remainingRaw <= 0 ? 0 : remainingRaw > 10 ? remainingRaw : 'fewer than 10';
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'public, max-age=60',
+    });
+    return res.end(JSON.stringify({
+      ok: true,
+      offer: {
+        id: offer.id,
+        name: offer.name,
+        itemDescription: offer.itemDescription,
+        imageUrl: offer.imageUrl,
+        retailValueCents: offer.retailValueCents,
+        weekEnd: offer.weekEnd,
+        remaining,
+      },
+    }));
+  } catch (e) {
+    log.error('handleGetActiveOffer crash', e?.message || e);
+    return sendJson(res, 500, err('Could not load offer.'));
+  }
+}
+
+export async function handleLeadMagnetOptIn(req, res) {
+  try {
+    return await _handleLeadMagnetOptIn(req, res);
+  } catch (e) {
+    log.error('handleLeadMagnetOptIn crash', e?.message || e, e?.stack);
+    return sendJson(res, 500, {
+      ok: false,
+      error: 'SAVE_FAILED',
+      detail: String(e?.message || e).slice(0, 240),
+    });
+  }
+}
+
+async function _handleLeadMagnetOptIn(req, res) {
+  const ip = clientIp(req);
+  if (!checkRateLimit(ip)) {
+    return sendJson(res, 429, { ok: false, error: 'RATE_LIMIT' });
+  }
+
+  const body = req.body || {};
+  const v = validateLeadMagnetPayload(body);
+  if (!v.ok) {
+    return sendJson(res, 400, { ok: false, error: v.code || 'VALIDATION', details: v.errors });
+  }
+  const { firstName, lastName, email, phone, qualifierAnswer } = v.value;
+  const userAgent = (req.headers['user-agent'] || '').slice(0, 200);
+
+  await ensureBootstrapped();
+  const offer = await getActiveOffer();
+  if (!offer) {
+    return sendJson(res, 200, { ok: true, exhausted: true });
+  }
+
+  // Per-item lifetime dedupe: email has already redeemed THIS item in any
+  // cycle (matched by offer name).
+  const claimed = await hasEverRedeemedSameItem(email, offer.name).catch(() => false);
+  if (claimed) {
+    return sendJson(res, 409, {
+      ok: false,
+      error: 'ALREADY_CLAIMED_ITEM',
+      itemName: offer.name,
+    });
+  }
+  // Recover & resume: the same email already has an unredeemed code for the
+  // current offer (their code email didn't arrive, they reloaded the form,
+  // etc.). Never reject — get them back to their existing claim instead.
+  const existing = await findUnredeemedCodeForOffer(email, offer.id).catch(() => null);
+  if (existing) {
+    const token = signLeadToken(existing.leadId);
+    if (existing.status === 'reserved') {
+      // Opted in but never booked the pickup — send them back to the picker.
+      // Booking there flips this same reserved code to 'issued'; no new code
+      // is created and no extra offer slot is consumed.
+      log.info(`gift opt-in resumed (reserved) ${existing.leadId} code=${existing.code}`);
+      return sendJson(res, 200, {
+        ok: true,
+        resumed: true,
+        leadId: existing.leadId,
+        redirect: `/booking/?lead=${encodeURIComponent(existing.leadId)}&t=${encodeURIComponent(token)}`,
+        offer: { name: offer.name, itemDescription: offer.itemDescription },
+      });
+    }
+    // status === 'issued' — already booked a pickup. Re-send the code email
+    // and tell the page to jump straight to the confirmed state.
+    const booking = existing.bookingId
+      ? await findBookingById(existing.bookingId).catch(() => null)
+      : null;
+    await resendRedemptionCodeEmail({ codeRow: existing, offer, booking, firstName, toEmail: email })
+      .catch((e) => log.warn(`resend code email failed for ${existing.code}: ${e?.message || e}`));
+    log.info(`gift opt-in resumed (issued) ${existing.leadId} code=${existing.code}`);
+    return sendJson(res, 200, {
+      ok: true,
+      resumed: true,
+      alreadyBooked: true,
+      leadId: existing.leadId,
+      offer: { name: offer.name, itemDescription: offer.itemDescription },
+      booking: booking ? { slot: booking.slot } : null,
+    });
+  }
+
+  const reserved = await reserveOfferSlot(offer.id);
+  if (!reserved) {
+    return sendJson(res, 200, { ok: true, exhausted: true });
+  }
+
+  let leadResult;
+  try {
+    leadResult = await createLead(
+      {
+        audience: QUALIFIER_TO_AUDIENCE[qualifierAnswer] || 'general',
+        firstName,
+        lastName: lastName || null,
+        phone,
+        email,
+        consent: true,
+        qualifierAnswer,
+        qualified: true,
+        source: 'lead-magnet',
+        offerId: offer.id,
+        ip,
+        userAgent,
+        ...(validateAttribution(body.attribution) || {}),
+      },
+      newLeadId
+    );
+  } catch (e) {
+    await releaseOfferSlot(offer.id).catch(() => {});
+    log.error('lead insert failed, released slot', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: 'SAVE_FAILED' });
+  }
+  if (!leadResult.ok) {
+    await releaseOfferSlot(offer.id).catch(() => {});
+    return sendJson(res, 500, { ok: false, error: 'SAVE_FAILED' });
+  }
+
+  // Reserve the redemption code; it gets flipped to 'issued' (and emailed)
+  // when the customer picks a pickup slot via /api/bookings.
+  const code = generateCode();
+  const expiresAt = isoDaysFromNow(7);
+  try {
+    await insertRedemptionCode({
+      code,
+      leadId: leadResult.lead.id,
+      offerId: offer.id,
+      expiresAt,
+    });
+  } catch (e) {
+    await releaseOfferSlot(offer.id).catch(() => {});
+    log.error('code insert failed, released slot', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: 'SAVE_FAILED' });
+  }
+
+  const token = signLeadToken(leadResult.lead.id);
+  log.info(`gift opt-in (reserved) ${leadResult.lead.id} offer=${offer.id} code=${code}`);
+
+  return sendJson(res, 200, {
+    ok: true,
+    leadId: leadResult.lead.id,
+    redirect: `/booking/?lead=${encodeURIComponent(leadResult.lead.id)}&t=${encodeURIComponent(token)}`,
+    offer: { name: offer.name, itemDescription: offer.itemDescription },
+  });
+}
+
+// ============================================================================
+// Cron
+// ============================================================================
+
+function verifyBearer(req, secretEnvName) {
+  const expected = process.env[secretEnvName];
+  if (!expected || expected.length < 16) return false;
+  const auth = req.headers['authorization'];
+  if (typeof auth !== 'string') return false;
+  const expectedHeader = `Bearer ${expected}`;
+  if (auth.length !== expectedHeader.length) return false;
+  let diff = 0;
+  for (let i = 0; i < auth.length; i++) {
+    diff |= auth.charCodeAt(i) ^ expectedHeader.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function verifyCronAuth(req)  { return verifyBearer(req, 'CRON_SECRET'); }
+
+/**
+ * Staff dashboard auth. Passes on EITHER a valid signed session cookie (set by
+ * POST /api/admin/login after the staff password) OR the legacy
+ * `Bearer STAFF_TOKEN` header. Guards every /api/admin/* endpoint that reads or
+ * writes customer data — intakes, special orders, bookings, sales, stats, and
+ * the gift-code redeem tool.
+ *
+ * Exception: /api/admin/ads-conversions uses HTTP Basic instead, because Google
+ * Ads' scheduled-upload fetcher can only send username/password.
+ *
+ * See lib/staff-auth.mjs for the cookie format and signing key.
+ */
+export function verifyStaffAuth(req) { return isStaffAuthed(req); }
+
+export function staffUnauthorized(res) {
+  return sendJson(res, 401, { ok: false, error: 'UNAUTHORIZED' });
+}
+
+function makeCronHandler(name, runner) {
+  return async function (req, res) {
+    if (!verifyCronAuth(req)) {
+      return sendJson(res, 401, { ok: false, error: 'UNAUTHORIZED' });
+    }
+    try {
+      const result = await runner();
+      return sendJson(res, 200, { ok: true, job: name, result });
+    } catch (e) {
+      log.error(`cron ${name} crash`, e?.message || e);
+      return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+    }
+  };
+}
+
+export const handleCronNurtureT3    = makeCronHandler('nurture-t3',    runNurtureT3);
+export const handleCronNurtureT1    = makeCronHandler('nurture-t1',    runNurtureT1);
+export const handleCronNurtureDayOf = makeCronHandler('nurture-dayof', runNurtureDayOf);
+export const handleCronExpireCodes  = makeCronHandler('expire-codes',  runExpireCodes);
+export const handleCronRotateOffer  = makeCronHandler('rotate-offer',  runRotateOffer);
+export const handleCronSyncAdSpend  = makeCronHandler('sync-ad-spend', runSyncAdSpend);
+
+// ============================================================================
+// Admin (staff redeem tool + funnel stats)
+// ============================================================================
+
+const CODE_RE = /^GIFT-[A-Z2-9]{6}$/;
+
+export async function handleAdminLookupCode(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  const url = getUrl(req);
+  const code = (url.searchParams.get('code') || '').toUpperCase().trim();
+  if (!CODE_RE.test(code)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_CODE' });
+  }
+  const found = await lookupCode(code);
+  if (!found) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+  return sendJson(res, 200, { ok: true, code: found });
+}
+
+export async function handleAdminRedeem(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  const body = req.body || {};
+  const code = typeof body.code === 'string' ? body.code.toUpperCase().trim() : '';
+  const staffId = typeof body.staffId === 'string' ? body.staffId.slice(0, 60) : null;
+  if (!CODE_RE.test(code)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_CODE' });
+  }
+  const result = await redeemCode(code, staffId);
+  if (!result.ok) {
+    const status = result.error === 'NOT_FOUND' ? 404
+                 : result.error === 'ALREADY_REDEEMED' ? 409
+                 : result.error === 'NOT_ISSUED' ? 409
+                 : 500;
+    return sendJson(res, status, result);
+  }
+  log.info(`code redeemed ${code} by ${staffId || 'unknown'}`);
+  return sendJson(res, 200, result);
+}
+
+export async function handleAdminFunnelStats(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  const url = getUrl(req);
+  const weeks = Math.max(1, Math.min(52, parseInt(url.searchParams.get('weeks') || '8', 10) || 8));
+  try {
+    const stats = await getFunnelStats(weeks);
+    return sendJson(res, 200, { ok: true, weeks: stats });
+  } catch (e) {
+    log.error('funnel-stats crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+// --- intake admin (staff dashboard) ----------------------------------------
+// Every handler below is staff-guarded: a password session cookie (see
+// lib/staff-auth.mjs) or the legacy Bearer STAFF_TOKEN. Inputs stay strictly
+// validated on top of that.
+
+function intakesToCsv(rows) {
+  const headers = [
+    'id', 'created_at', 'first_name', 'last_name', 'phone', 'email',
+    'ticket_number', 'tailoring_notes', 'additional_notes', 'need_by_date', 'tailor_status',
+  ];
+  const escape = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.join(',')];
+  for (const r of rows) {
+    lines.push([
+      r.id, r.createdAt, r.firstName, r.lastName, r.phone, r.email,
+      r.ticketNumber, r.tailoringNotes, r.additionalNotes, r.needByDate, r.tailorStatus,
+    ].map(escape).join(','));
+  }
+  return lines.join('\r\n');
+}
+
+export async function handleAdminListIntakes(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const url = getUrl(req);
+  const status = url.searchParams.get('status') || 'all';
+  const search = url.searchParams.get('q') || '';
+  const limit = parseInt(url.searchParams.get('limit') || '200', 10) || 200;
+  const format = url.searchParams.get('format') || 'json';
+
+  try {
+    const intakes = await listIntakes({ status, search, limit });
+    if (format === 'csv') {
+      const csv = intakesToCsv(intakes);
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': `attachment; filename="intakes-${stamp}.csv"`,
+        'cache-control': 'no-store',
+      });
+      return res.end(csv);
+    }
+    return sendJson(res, 200, { ok: true, intakes });
+  } catch (e) {
+    log.error('admin list intakes crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminUpdateIntake(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  const status = typeof body.tailorStatus === 'string' ? body.tailorStatus : '';
+  if (!id || !/^IN-[A-F0-9]+$/i.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const result = await updateIntakeTailorStatus(id, status);
+    if (!result.ok) {
+      const code = result.error === 'INVALID_STATUS' ? 400 : 404;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    log.info(`intake ${id} tailor_status → ${status}`);
+    return sendJson(res, 200, { ok: true });
+  } catch (e) {
+    log.error('admin update intake crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminEditIntake(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!id || !/^IN-[A-F0-9]+$/i.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+
+  const errors = [];
+  const updates = {};
+
+  if ('firstName' in body) {
+    const v = validateName(body.firstName, 'First name');
+    if (!v.ok) errors.push(...v.errors); else updates.firstName = v.value;
+  }
+  if ('lastName' in body) {
+    const v = validateName(body.lastName, 'Last name');
+    if (!v.ok) errors.push(...v.errors); else updates.lastName = v.value;
+  }
+  if ('phone' in body) {
+    const v = validatePhone(body.phone);
+    if (!v.ok) errors.push(...v.errors); else updates.phone = v.value;
+  }
+  if ('email' in body) {
+    const v = validateEmail(body.email);
+    if (!v.ok) errors.push(...v.errors); else updates.email = v.value;
+  }
+  if ('ticketNumber' in body) {
+    updates.ticketNumber = String(body.ticketNumber || '').trim().slice(0, 32);
+  }
+  if ('tailoringNotes' in body) {
+    const t = String(body.tailoringNotes || '').trim();
+    if (t.length === 0) errors.push('Pick at least one thing that needs to be tailored.');
+    else if (t.length > 500) errors.push('Tailoring notes are too long (max 500 characters).');
+    else updates.tailoringNotes = t;
+  }
+  if ('additionalNotes' in body) {
+    const n = String(body.additionalNotes || '').trim();
+    if (n.length > 500) errors.push('Additional notes are too long (max 500 characters).');
+    else updates.additionalNotes = n;
+  }
+  if ('needByDate' in body) {
+    const v = validateDateString(body.needByDate, 'Need-by date');
+    if (!v.ok) errors.push(...v.errors); else updates.needByDate = v.value;
+  }
+
+  if (errors.length > 0) {
+    return sendJson(res, 400, { ok: false, error: errors.join(' ') });
+  }
+
+  try {
+    const result = await updateIntakeFields(id, updates);
+    if (!result.ok) {
+      const code = result.error === 'NOT_FOUND' ? 404 : 400;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    const updated = await findIntakeById(id);
+    log.info(`intake ${id} edited fields: ${Object.keys(updates).join(',')}`);
+    return sendJson(res, 200, { ok: true, data: updated });
+  } catch (e) {
+    log.error('admin edit intake crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminDeleteIntake(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!id || !/^IN-[A-F0-9]+$/i.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const result = await deleteIntake(id);
+    if (!result.ok) return sendJson(res, 404, { ok: false, error: result.error });
+    log.info(`intake ${id} deleted`);
+    return sendJson(res, 200, { ok: true });
+  } catch (e) {
+    log.error('admin delete intake crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminNotifyIntakeReady(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  const force = body.force === true;
+  if (!id || !/^IN-[A-F0-9]+$/i.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const intake = await findIntakeById(id);
+    if (!intake) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+    if (intake.tailorStatus !== 'back') {
+      return sendJson(res, 409, { ok: false, error: 'NOT_READY', tailorStatus: intake.tailorStatus });
+    }
+    if (!force && intake.pickupNoticeStatus === 'sent') {
+      return sendJson(res, 409, { ok: false, error: 'ALREADY_SENT', sentAt: intake.pickupNoticeSentAt });
+    }
+
+    const result = await sendPickupReadyNotification(intake);
+    if (!result.ok) {
+      log.error(`pickup-ready notify failed for ${id}`, { email: result.email, sms: result.sms });
+      return sendJson(res, 502, { ok: false, error: 'SEND_FAILED', email: result.email, sms: result.sms });
+    }
+
+    const sentAt = new Date().toISOString();
+    await markIntakePickupNoticeSent(id, { status: 'sent', sentAt });
+    log.info(`intake ${id} pickup notice sent`, { email: result.email.ok, sms: result.sms.ok });
+    return sendJson(res, 200, { ok: true, sentAt, email: result.email, sms: result.sms });
+  } catch (e) {
+    log.error('admin notify intake ready crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+// --- special-orders admin (staff dashboard) --------------------------------
+
+const SO_ID_RE = /^SO-[A-F0-9]+$/i;
+
+function specialOrdersToCsv(rows) {
+  const headers = [
+    'id', 'created_at', 'first_name', 'last_name', 'phone', 'email',
+    'item_type', 'color', 'size', 'description', 'additional_notes',
+    'need_by_date', 'order_status', 'ordered_at', 'arrived_at', 'picked_up_at',
+  ];
+  const escape = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.join(',')];
+  for (const r of rows) {
+    lines.push([
+      r.id, r.createdAt, r.firstName, r.lastName, r.phone, r.email,
+      r.itemType, r.color, r.size, r.description, r.additionalNotes,
+      r.needByDate, r.orderStatus, r.orderedAt, r.arrivedAt, r.pickedUpAt,
+    ].map(escape).join(','));
+  }
+  return lines.join('\r\n');
+}
+
+// Validates the editable special-order fields out of a request body. Each
+// field is optional; the caller decides whether absence means "skip" (edit)
+// or "use default" (create). Customer identity fields (firstName/lastName/
+// phone/email) are all optional individually — the caller enforces the
+// "at least one identifier" rule on creation.
+function validateSpecialOrderBody(body, { isCreate }) {
+  const errors = [];
+  const out = {};
+
+  const trimOptional = (raw, label, max) => {
+    if (raw === undefined || raw === null) return undefined;
+    const s = String(raw).trim();
+    if (max && s.length > max) {
+      errors.push(`${label} is too long (max ${max} characters).`);
+      return undefined;
+    }
+    return s;
+  };
+
+  if ('firstName' in body) {
+    const v = trimOptional(body.firstName, 'First name', 60);
+    if (v !== undefined) out.firstName = v;
+  }
+  if ('lastName' in body) {
+    const v = trimOptional(body.lastName, 'Last name', 60);
+    if (v !== undefined) out.lastName = v;
+  }
+
+  if ('phone' in body) {
+    const raw = String(body.phone ?? '').trim();
+    if (raw.length === 0) {
+      out.phone = '';
+    } else {
+      const v = validatePhone(raw);
+      if (!v.ok) errors.push(...v.errors);
+      else out.phone = v.value;
+    }
+  }
+
+  if ('email' in body) {
+    const raw = String(body.email ?? '').trim();
+    if (raw.length === 0) {
+      out.email = '';
+    } else {
+      const v = validateEmail(raw);
+      if (!v.ok) errors.push(...v.errors);
+      else out.email = v.value;
+    }
+  }
+
+  if (isCreate || 'itemType' in body) {
+    const raw = String(body.itemType ?? '').trim().toLowerCase();
+    if (!VALID_ITEM_TYPES.includes(raw)) {
+      errors.push(`Item type must be one of: ${VALID_ITEM_TYPES.join(', ')}.`);
+    } else {
+      out.itemType = raw;
+    }
+  }
+
+  if ('color' in body) {
+    const v = trimOptional(body.color, 'Color', 60);
+    if (v !== undefined) out.color = v;
+  }
+  if ('size' in body) {
+    const v = trimOptional(body.size, 'Size', 32);
+    if (v !== undefined) out.size = v;
+  }
+  if ('description' in body) {
+    const v = trimOptional(body.description, 'Description', 500);
+    if (v !== undefined) out.description = v;
+  }
+  if ('additionalNotes' in body) {
+    const v = trimOptional(body.additionalNotes, 'Additional notes', 500);
+    if (v !== undefined) out.additionalNotes = v;
+  }
+
+  if ('needByDate' in body) {
+    const raw = String(body.needByDate ?? '').trim();
+    if (raw.length === 0) {
+      out.needByDate = '';
+    } else {
+      const v = validateDateString(raw, 'Need-by date');
+      if (!v.ok) errors.push(...v.errors);
+      else out.needByDate = v.value;
+    }
+  }
+
+  return { errors, fields: out };
+}
+
+export async function handleAdminListSpecialOrders(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const url = getUrl(req);
+  const status = url.searchParams.get('status') || 'all';
+  const search = url.searchParams.get('q') || '';
+  const limit = parseInt(url.searchParams.get('limit') || '200', 10) || 200;
+  const format = url.searchParams.get('format') || 'json';
+
+  try {
+    const orders = await listSpecialOrders({ status, search, limit });
+    if (format === 'csv') {
+      const csv = specialOrdersToCsv(orders);
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': `attachment; filename="special-orders-${stamp}.csv"`,
+        'cache-control': 'no-store',
+      });
+      return res.end(csv);
+    }
+    return sendJson(res, 200, { ok: true, orders });
+  } catch (e) {
+    log.error('admin list special orders crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminCreateSpecialOrder(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+
+  const { errors, fields } = validateSpecialOrderBody(body, { isCreate: true });
+
+  // Require at least one identifying field so we don't end up with anonymous
+  // orders that staff can't trace back to a customer.
+  const hasIdentifier = Boolean(
+    fields.firstName || fields.lastName || fields.phone || fields.email,
+  );
+  if (!hasIdentifier) {
+    errors.push('Add at least a customer name, phone, or email.');
+  }
+
+  if (errors.length > 0) {
+    return sendJson(res, 400, { ok: false, error: errors.join(' ') });
+  }
+
+  try {
+    const result = await createSpecialOrder(fields, newSpecialOrderId);
+    log.info(`special order ${result.order.id} created`);
+    return sendJson(res, 200, { ok: true, data: result.order });
+  } catch (e) {
+    log.error('admin create special order crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminEditSpecialOrder(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!id || !SO_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+
+  const { errors, fields } = validateSpecialOrderBody(body, { isCreate: false });
+  if (errors.length > 0) {
+    return sendJson(res, 400, { ok: false, error: errors.join(' ') });
+  }
+
+  try {
+    const result = await updateSpecialOrderFields(id, fields);
+    if (!result.ok) {
+      const code = result.error === 'NOT_FOUND' ? 404 : 400;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    const updated = await findSpecialOrderById(id);
+    log.info(`special order ${id} edited fields: ${Object.keys(fields).join(',')}`);
+    return sendJson(res, 200, { ok: true, data: updated });
+  } catch (e) {
+    log.error('admin edit special order crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminUpdateSpecialOrderStatus(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  const status = typeof body.orderStatus === 'string' ? body.orderStatus : '';
+  if (!id || !SO_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  if (!VALID_ORDER_STATUSES.includes(status)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_STATUS' });
+  }
+  try {
+    const result = await updateSpecialOrderStatus(id, status);
+    if (!result.ok) {
+      const code = result.error === 'NOT_FOUND' ? 404 : 400;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    const updated = await findSpecialOrderById(id);
+    log.info(`special order ${id} order_status → ${status}`);
+    return sendJson(res, 200, { ok: true, data: updated });
+  } catch (e) {
+    log.error('admin update special order status crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminDeleteSpecialOrder(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!id || !SO_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const result = await deleteSpecialOrder(id);
+    if (!result.ok) return sendJson(res, 404, { ok: false, error: result.error });
+    log.info(`special order ${id} deleted`);
+    return sendJson(res, 200, { ok: true });
+  } catch (e) {
+    log.error('admin delete special order crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminNotifySpecialOrderArrived(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  const force = body.force === true;
+  if (!id || !SO_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const order = await findSpecialOrderById(id);
+    if (!order) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+    if (order.orderStatus !== 'arrived') {
+      return sendJson(res, 409, { ok: false, error: 'NOT_READY', orderStatus: order.orderStatus });
+    }
+    if (!order.phone && !order.email) {
+      return sendJson(res, 400, { ok: false, error: 'NO_CONTACT', detail: 'Order has no phone or email on file.' });
+    }
+    if (!force && order.arrivalNoticeStatus === 'sent') {
+      return sendJson(res, 409, { ok: false, error: 'ALREADY_SENT', sentAt: order.arrivalNoticeSentAt });
+    }
+
+    const result = await sendSpecialOrderArrivedNotification(order);
+    if (!result.ok) {
+      log.error(`special-order arrival notify failed for ${id}`, { email: result.email, sms: result.sms });
+      return sendJson(res, 502, { ok: false, error: 'SEND_FAILED', email: result.email, sms: result.sms });
+    }
+
+    const sentAt = new Date().toISOString();
+    await markSpecialOrderArrivalNoticeSent(id, { status: 'sent', sentAt });
+    log.info(`special order ${id} arrival notice sent`, { email: result.email.ok, sms: result.sms.ok });
+    return sendJson(res, 200, { ok: true, sentAt, email: result.email, sms: result.sms });
+  } catch (e) {
+    log.error('admin notify special order arrived crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+// --- bookings admin (staff dashboard — Appointments view) ------------------
+
+const BK_ID_RE = /^BK-[A-F0-9]+$/i;
+
+function bookingsToCsv(rows) {
+  const headers = [
+    'id', 'created_at', 'audience', 'staff_status',
+    'first_name', 'last_name', 'phone', 'email',
+    'slot_date', 'slot_time', 'slot_duration', 'answers',
+    'sale_amount', 'sale_recorded_at', 'sale_notes',
+    'gclid', 'utm_source', 'utm_campaign', 'landing_page',
+  ];
+  const escape = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.join(',')];
+  for (const r of rows) {
+    const c = r.customer || {};
+    lines.push([
+      r.id, r.createdAt, r.audience, r.staffStatus,
+      c.firstName, c.lastName, c.phone, c.email,
+      r.slot?.date, r.slot?.time, r.slot?.durationMinutes,
+      JSON.stringify(r.answers || {}),
+      r.saleAmountCents == null ? '' : (r.saleAmountCents / 100).toFixed(2),
+      r.saleRecordedAt, r.saleNotes,
+      r.gclid, r.utm?.source, r.utm?.campaign, r.landingPage,
+    ].map(escape).join(','));
+  }
+  return lines.join('\r\n');
+}
+
+export async function handleAdminListBookings(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const url = getUrl(req);
+  const status = url.searchParams.get('status') || 'all';
+  const audience = url.searchParams.get('audience') || 'all';
+  const search = url.searchParams.get('q') || '';
+  const limit = parseInt(url.searchParams.get('limit') || '200', 10) || 200;
+  const format = url.searchParams.get('format') || 'json';
+
+  try {
+    const bookings = await listBookings({ status, audience, search, limit });
+    if (format === 'csv') {
+      const csv = bookingsToCsv(bookings);
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': `attachment; filename="appointments-${stamp}.csv"`,
+        'cache-control': 'no-store',
+      });
+      return res.end(csv);
+    }
+    const newCount = await countNewBookings();
+    return sendJson(res, 200, { ok: true, bookings, newCount });
+  } catch (e) {
+    log.error('admin list bookings crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminBookingsCount(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  try {
+    const newCount = await countNewBookings();
+    return sendJson(res, 200, { ok: true, newCount });
+  } catch (e) {
+    log.error('admin bookings count crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminUpdateBookingStatus(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  const status = typeof body.staffStatus === 'string' ? body.staffStatus : '';
+  if (!id || !BK_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const result = await updateBookingStaffStatus(id, status);
+    if (!result.ok) {
+      const code = result.error === 'INVALID_STATUS' ? 400 : 404;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    log.info(`booking ${id} staff_status → ${status}`);
+    // Return the fresh badge count so the dashboard updates without a refetch.
+    const newCount = await countNewBookings();
+    return sendJson(res, 200, { ok: true, newCount });
+  } catch (e) {
+    log.error('admin update booking status crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminEditBooking(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!id || !BK_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+
+  const errors = [];
+  const customer = {};
+  let slotDate;
+  let slotTime;
+  const answers = {};
+
+  if ('firstName' in body) {
+    const v = validateName(body.firstName, 'First name');
+    if (!v.ok) errors.push(...v.errors); else customer.firstName = v.value;
+  }
+  if ('lastName' in body) {
+    const v = validateName(body.lastName, 'Last name');
+    if (!v.ok) errors.push(...v.errors); else customer.lastName = v.value;
+  }
+  if ('phone' in body) {
+    const v = validatePhone(body.phone);
+    if (!v.ok) errors.push(...v.errors); else customer.phone = v.value;
+  }
+  if ('email' in body) {
+    const v = validateEmail(body.email);
+    if (!v.ok) errors.push(...v.errors); else customer.email = v.value;
+  }
+  if ('slotDate' in body) {
+    const v = validateDateString(body.slotDate, 'Appointment date');
+    if (!v.ok) errors.push(...v.errors); else slotDate = v.value;
+  }
+  if ('slotTime' in body) {
+    const v = validateTimeString(body.slotTime);
+    if (!v.ok) errors.push(...v.errors); else slotTime = v.value;
+  }
+  if (body.answers && typeof body.answers === 'object' && !Array.isArray(body.answers)) {
+    for (const [key, raw] of Object.entries(body.answers)) {
+      const s = String(raw ?? '').trim();
+      if (s.length > 500) {
+        errors.push(`"${key}" is too long (max 500 characters).`);
+        continue;
+      }
+      answers[key] = s;
+    }
+  }
+
+  if (errors.length > 0) {
+    return sendJson(res, 400, { ok: false, error: errors.join(' ') });
+  }
+
+  try {
+    const result = await updateBookingFields(id, { customer, answers, slotDate, slotTime });
+    if (!result.ok) {
+      const code = result.error === 'NOT_FOUND' ? 404
+                 : result.error === 'SLOT_TAKEN' ? 409
+                 : 400;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    const updated = await findBookingById(id);
+    log.info(`booking ${id} edited`);
+    return sendJson(res, 200, { ok: true, data: updated });
+  } catch (e) {
+    log.error('admin edit booking crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+/**
+ * Staff manual booking entry — for phone and walk-in appointments that never
+ * touched the public form. Differences from the public handler:
+ * - email is optional (phone callers often don't give one); no confirmation
+ *   email or owner SMS fires — staff are the ones entering it
+ * - the slot is not checked against the public availability grid, so staff
+ *   can record any time; UNIQUE(slot_date, slot_time) still rejects true
+ *   double-bookings with SLOT_TAKEN
+ */
+export async function handleAdminCreateBooking(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+
+  const errors = [];
+  if (!isValidAudience(body.audience)) errors.push('Unknown audience.');
+
+  const fn = validateName(body.firstName, 'First name');
+  if (!fn.ok) errors.push(...fn.errors);
+  const ln = validateName(body.lastName, 'Last name');
+  if (!ln.ok) errors.push(...ln.errors);
+  const ph = validatePhone(body.phone);
+  if (!ph.ok) errors.push(...ph.errors);
+
+  let email = '';
+  if (typeof body.email === 'string' && body.email.trim() !== '') {
+    const em = validateEmail(body.email);
+    if (!em.ok) errors.push(...em.errors); else email = em.value;
+  }
+
+  const dt = validateDateString(body.slotDate, 'Appointment date');
+  if (!dt.ok) errors.push(...dt.errors);
+  const tm = validateTimeString(body.slotTime);
+  if (!tm.ok) errors.push(...tm.errors);
+
+  const answers = {};
+  if (body.answers && typeof body.answers === 'object' && !Array.isArray(body.answers)) {
+    for (const [key, raw] of Object.entries(body.answers)) {
+      const s = String(raw ?? '').trim();
+      if (s.length > 500) {
+        errors.push(`"${key}" is too long (max 500 characters).`);
+        continue;
+      }
+      if (s) answers[key] = s;
+    }
+  }
+
+  if (errors.length > 0) {
+    return sendJson(res, 400, { ok: false, error: errors.join(' ') });
+  }
+
+  const cfg = await loadConfig();
+  const fitting = cfg.fittingTypes[body.audience];
+  const durationMinutes = fitting?.slotDurationMinutes ?? cfg.defaultSlotDurationMinutes ?? 20;
+
+  const record = {
+    audience: body.audience,
+    customer: { firstName: fn.value, lastName: ln.value, phone: ph.value, email },
+    answers,
+    slot: { date: dt.value, time: tm.value, durationMinutes, tz: cfg.storeTimezone },
+    displayTimezone: cfg.storeTimezone,
+    consent: true,
+    leadId: null,
+    ip: clientIp(req),
+    userAgent: 'staff-manual-entry',
+    emailStatus: 'skipped',
+    emailDetail: 'Manual staff entry — no confirmation email sent',
+  };
+
+  try {
+    const result = await createBooking(record, newBookingId);
+    if (!result.ok) {
+      const code = result.error === 'SLOT_TAKEN' ? 409 : 500;
+      return sendJson(res, code, { ok: false, error: result.error });
+    }
+    log.info(`booking created (staff manual) ${result.booking.id} ${record.audience} ${record.slot.date} ${record.slot.time}`);
+    const newCount = await countNewBookings();
+    return sendJson(res, 200, { ok: true, data: result.booking, newCount });
+  } catch (e) {
+    log.error('admin create booking crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleAdminDeleteBooking(req, res) {
+  if (!verifyStaffAuth(req)) return staffUnauthorized(res);
+  await ensureBootstrapped();
+  const body = req.body || {};
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!id || !BK_ID_RE.test(id)) {
+    return sendJson(res, 400, { ok: false, error: 'INVALID_ID' });
+  }
+  try {
+    const result = await deleteBooking(id);
+    if (!result.ok) return sendJson(res, 404, { ok: false, error: result.error });
+    log.info(`booking ${id} deleted`);
+    // staff_status may have been 'new' — return the fresh badge count.
+    const newCount = await countNewBookings();
+    return sendJson(res, 200, { ok: true, newCount });
+  } catch (e) {
+    log.error('admin delete booking crash', e?.message || e);
+    return sendJson(res, 500, { ok: false, error: e?.message || 'CRASH' });
+  }
+}
+
+export async function handleLeadLookup(req, res) {
+  const url = getUrl(req);
+  const leadId = url.searchParams.get('lead');
+  const token = url.searchParams.get('t');
+  if (!leadId || !token) {
+    return sendJson(res, 400, { ok: false, error: 'MISSING_PARAMS' });
+  }
+  if (!verifyLeadToken(leadId, token)) {
+    return sendJson(res, 401, { ok: false, error: 'INVALID_TOKEN' });
+  }
+  const lead = await findLeadById(leadId);
+  if (!lead) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+
+  let offer = null;
+  if (lead.offerId) {
+    const o = await findOfferById(lead.offerId).catch(() => null);
+    if (o) offer = { id: o.id, name: o.name, itemDescription: o.itemDescription };
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    lead: {
+      firstName: lead.firstName,
+      lastName: lead.lastName || '',
+      email: lead.email,
+      phone: lead.phone,
+      audience: lead.audience || 'general',
+    },
+    offer,
+  });
+}
+
+export async function handleGetBookingIcs(req, res, id) {
+  if (!id || !/^BK-[A-F0-9]+$/i.test(id)) {
+    res.writeHead(400);
+    return res.end('Invalid booking id.');
+  }
+  const b = await findBookingById(id);
+  if (!b) {
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+  const cfg = await loadConfig();
+  const audienceLabel = cfg.fittingTypes?.[b.audience]?.label || b.audience;
+  const businessName = process.env.BUSINESS_NAME || 'Suit Station';
+  const businessAddress = process.env.BUSINESS_ADDRESS || '150 Pearl Nix Pkwy, Gainesville GA 30501';
+  const ics = buildICS({
+    id: b.id,
+    slot: b.slot,
+    durationMinutes: b.slot.durationMinutes,
+    tz: b.slot.tz,
+    summary: `${audienceLabel} at ${businessName}`,
+    description: `Your fitting at ${businessName}. Reference: ${b.id}.`,
+    location: businessAddress,
+  });
+  res.writeHead(200, {
+    'content-type': 'text/calendar; charset=utf-8',
+    'content-disposition': `attachment; filename="fitting-${b.id}.ics"`,
+    'cache-control': 'no-store',
+  });
+  res.end(ics);
+}

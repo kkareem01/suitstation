@@ -1,0 +1,1396 @@
+/**
+ * Tiny unit-test runner using Node's built-in assert. No deps.
+ * Run: node tests/run.mjs
+ */
+
+import assert from 'node:assert/strict';
+import { rm, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+
+import { migrate } from '../lib/migrate.mjs';
+import { getDb } from '../lib/db.mjs';
+
+import {
+  validatePhone,
+  validateEmail,
+  validateName,
+  validateBookingPayload,
+  validateLeadPayload,
+  validateAttribution,
+} from '../lib/validate.mjs';
+import { formatConversionTime, buildAdsCsv } from '../lib/ads-feed.mjs';
+import {
+  generateSlotsForDate,
+  filterAvailableSlots,
+  listMonth,
+  dayOfWeek,
+  addDays,
+  daysInMonth,
+} from '../lib/slots.mjs';
+import { buildICS } from '../lib/ics.mjs';
+import { newBookingId, newLeadId } from '../lib/id.mjs';
+import { fieldNames } from '../lib/audiences.mjs';
+import { ownerBookingSmsBody, notifyOwnerOfBooking } from '../lib/notify-owner-booking.mjs';
+import { nurtureT1Sms, nurtureDayOfSms, nurtureT3Sms } from '../lib/reminder-sms.mjs';
+import { reminderT3Email, reminderT1Email, reminderDayOfEmail } from '../lib/reminder-email.mjs';
+import { runNurtureT1 } from '../lib/cron.mjs';
+
+const results = [];
+let passed = 0;
+let failed = 0;
+
+function test(name, fn) {
+  try {
+    fn();
+    results.push(`  ✓ ${name}`);
+    passed++;
+  } catch (e) {
+    results.push(`  ✗ ${name}\n    ${e.message}`);
+    failed++;
+  }
+}
+
+async function testAsync(name, fn) {
+  try {
+    await fn();
+    results.push(`  ✓ ${name}`);
+    passed++;
+  } catch (e) {
+    results.push(`  ✗ ${name}\n    ${e.message}`);
+    failed++;
+  }
+}
+
+const baseConfig = {
+  storeTimezone: 'America/New_York',
+  businessHours: {
+    sun: { open: '12:00', close: '17:00' },
+    mon: { open: '10:00', close: '19:00' },
+    tue: { open: '10:00', close: '19:00' },
+    wed: { open: '10:00', close: '19:00' },
+    thu: { open: '10:00', close: '19:00' },
+    fri: { open: '10:00', close: '19:00' },
+    sat: { open: '10:00', close: '18:00' },
+  },
+  blackoutDates: ['2026-12-25'],
+  defaultSlotDurationMinutes: 20,
+  fittingTypes: {
+    weddings: { label: 'Wedding fitting', slotDurationMinutes: 30, buffer: 5 },
+    general:  { label: 'Styling session', slotDurationMinutes: 30, buffer: 5 },
+  },
+  urgencyTimerSeconds: 156,
+  leadTimeMinutes: 0,
+  maxAdvanceDays: 365,
+};
+
+// =========================================================================
+console.log('\nvalidate.mjs');
+// =========================================================================
+
+test('validatePhone accepts (470) 595-7775 format', () => {
+  const r = validatePhone('(470) 595-7775');
+  assert.equal(r.ok, true);
+  assert.equal(r.value, '(470) 595-7775');
+});
+
+test('validatePhone normalizes 4705957775', () => {
+  const r = validatePhone('4705957775');
+  assert.equal(r.ok, true);
+  assert.equal(r.value, '(470) 595-7775');
+});
+
+test('validatePhone strips leading +1', () => {
+  const r = validatePhone('+1 (470) 595-7775');
+  assert.equal(r.ok, true);
+  assert.equal(r.value, '(470) 595-7775');
+});
+
+test('validatePhone rejects 9-digit numbers', () => {
+  assert.equal(validatePhone('470595777').ok, false);
+});
+
+test('validateEmail lowercases', () => {
+  const r = validateEmail('John@Example.com');
+  assert.equal(r.value, 'john@example.com');
+});
+
+test('validateEmail rejects bare strings', () => {
+  assert.equal(validateEmail('not-an-email').ok, false);
+});
+
+test('validateName trims and rejects whitespace-only', () => {
+  assert.equal(validateName('  ').ok, false);
+  assert.equal(validateName(' Sam ').value, 'Sam');
+});
+
+test('validateBookingPayload rejects honeypot fill', () => {
+  const r = validateBookingPayload(
+    {
+      audience: 'weddings',
+      customer: { firstName: 'A', lastName: 'B', phone: '4705957775', email: 'a@b.co', consent: true },
+      slot: { date: '2026-05-08', time: '14:00' },
+      timezone: 'America/New_York',
+      answers: { role: 'Groom', eventDate: '2026-09-12', partySize: 'Just me' },
+      honeypot: 'http://spam.example',
+      formStartedAt: 0,
+    },
+    Date.now()
+  );
+  assert.equal(r.ok, false);
+});
+
+test('validateBookingPayload rejects sub-4s submission', () => {
+  const now = Date.now();
+  const r = validateBookingPayload(
+    {
+      audience: 'weddings',
+      customer: { firstName: 'A', lastName: 'B', phone: '4705957775', email: 'a@b.co', consent: true },
+      slot: { date: '2026-05-08', time: '14:00' },
+      answers: { role: 'Groom', eventDate: '2026-09-12', partySize: 'Just me' },
+      formStartedAt: now - 1000,
+    },
+    now
+  );
+  assert.equal(r.ok, false);
+});
+
+test('validateBookingPayload accepts a complete weddings payload', () => {
+  const now = Date.now();
+  const r = validateBookingPayload(
+    {
+      audience: 'weddings',
+      customer: { firstName: ' Sam ', lastName: 'Lee', phone: '+14705957775', email: 'Sam@X.com', consent: true },
+      slot: { date: '2026-05-08', time: '14:00' },
+      timezone: 'America/New_York',
+      answers: { role: 'Groom', eventDate: '2026-09-12', partySize: '5-7' },
+      formStartedAt: now - 10000,
+    },
+    now
+  );
+  assert.equal(r.ok, true, r.errors?.join(' '));
+  assert.equal(r.value.customer.firstName, 'Sam');
+  assert.equal(r.value.customer.email, 'sam@x.com');
+  assert.equal(r.value.customer.phone, '(470) 595-7775');
+});
+
+test('validateBookingPayload rejects unknown select option', () => {
+  const r = validateBookingPayload(
+    {
+      audience: 'weddings',
+      customer: { firstName: 'A', lastName: 'B', phone: '4705957775', email: 'a@b.co', consent: true },
+      slot: { date: '2026-05-08', time: '14:00' },
+      answers: { eventDate: '2026-09-12', partySize: 'Wizard' },
+      formStartedAt: 0,
+    },
+    Date.now()
+  );
+  assert.equal(r.ok, false);
+});
+
+test('validateLeadPayload requires consent=true', () => {
+  const r = validateLeadPayload({
+    audience: 'general',
+    firstName: 'A',
+    lastName: 'B',
+    phone: '4705957775',
+    consent: false,
+  });
+  assert.equal(r.ok, false);
+});
+
+// =========================================================================
+console.log('\nslots.mjs');
+// =========================================================================
+
+test('dayOfWeek matches calendar', () => {
+  // 2026-04-25 was a Saturday
+  assert.equal(dayOfWeek('2026-04-25'), 6);
+});
+
+test('addDays handles month rollover', () => {
+  assert.equal(addDays('2026-01-30', 5), '2026-02-04');
+});
+
+test('daysInMonth Feb 2024 leap year', () => {
+  assert.equal(daysInMonth(2024, 2), 29);
+});
+
+test('generateSlotsForDate returns [] on blackout', () => {
+  const slots = generateSlotsForDate('2026-12-25', baseConfig, 'weddings');
+  assert.deepEqual(slots, []);
+});
+
+test('generateSlotsForDate weddings on Saturday produces 30+5min slots', () => {
+  // 2026-04-25 is Saturday, 10:00–18:00, 30+5 = 35min step
+  const slots = generateSlotsForDate('2026-04-25', baseConfig, 'weddings');
+  assert.equal(slots[0], '10:00');
+  assert.equal(slots[1], '10:35');
+  // last slot must end <= 18:00
+  const [h, m] = slots[slots.length - 1].split(':').map(Number);
+  assert.ok(h * 60 + m + 30 <= 18 * 60);
+});
+
+test('filterAvailableSlots removes booked times', () => {
+  const all = ['10:00', '10:35', '11:10'];
+  const tomorrow = addDays(
+    new Date().toISOString().slice(0, 10),
+    1
+  );
+  const open = filterAvailableSlots(all, new Set(['10:35']), tomorrow, baseConfig);
+  assert.deepEqual(open, ['10:00', '11:10']);
+});
+
+test('listMonth includes one entry per day', () => {
+  const days = listMonth(2026, 5, baseConfig, 'weddings', new Map());
+  assert.equal(days.length, 31);
+  assert.equal(days[0].date, '2026-05-01');
+});
+
+// =========================================================================
+console.log('\nics.mjs');
+// =========================================================================
+
+test('buildICS contains required fields', () => {
+  const ics = buildICS({
+    id: 'BK-TEST',
+    slot: { date: '2026-05-08', time: '14:00' },
+    durationMinutes: 30,
+    tz: 'America/New_York',
+    summary: 'Test event',
+    description: 'Description, with comma; and semi',
+    location: '150 Pearl Nix Pkwy',
+  });
+  assert.ok(ics.includes('BEGIN:VCALENDAR'));
+  assert.ok(ics.includes('BEGIN:VEVENT'));
+  assert.ok(ics.includes('UID:BK-TEST@suitstation.us'));
+  assert.ok(ics.includes('SUMMARY:Test event'));
+  // commas must be escaped
+  assert.ok(ics.includes('Description\\, with comma\\; and semi'));
+  // line endings are CRLF
+  assert.ok(ics.includes('\r\n'));
+});
+
+test('buildICS DST: May (EDT) and February (EST) produce different UTC starts', () => {
+  const dst = buildICS({
+    id: 'BK-DST', slot: { date: '2026-05-08', time: '14:00' },
+    durationMinutes: 30, tz: 'America/New_York',
+    summary: 's', description: 'd', location: 'l',
+  });
+  const std = buildICS({
+    id: 'BK-STD', slot: { date: '2026-02-08', time: '14:00' },
+    durationMinutes: 30, tz: 'America/New_York',
+    summary: 's', description: 'd', location: 'l',
+  });
+  // EDT 14:00 = 18:00 UTC; EST 14:00 = 19:00 UTC
+  assert.ok(dst.includes('DTSTART:20260508T180000Z'), 'EDT start should be 18:00Z');
+  assert.ok(std.includes('DTSTART:20260208T190000Z'), 'EST start should be 19:00Z');
+});
+
+// =========================================================================
+console.log('\nid.mjs');
+// =========================================================================
+
+test('newBookingId / newLeadId have correct shape', () => {
+  const b = newBookingId();
+  const l = newLeadId();
+  assert.ok(/^BK-[A-F0-9]{8}$/.test(b), `unexpected ${b}`);
+  assert.ok(/^LD-[A-F0-9]{8}$/.test(l), `unexpected ${l}`);
+});
+
+test('newBookingId is unique across 1000 calls', () => {
+  const set = new Set();
+  for (let i = 0; i < 1000; i++) set.add(newBookingId());
+  assert.equal(set.size, 1000);
+});
+
+// =========================================================================
+console.log('\noffers.mjs findUnredeemedCodeForOffer');
+// =========================================================================
+
+await testAsync('findUnredeemedCodeForOffer: recovers reserved/issued, ignores redeemed', async () => {
+  // Fresh test DB (TURSO_DATABASE_URL from .env.test, defaults to file:test.db).
+  await rm('test.db', { force: true });
+  await rm('test.db-journal', { force: true });
+  await migrate();
+
+  const { createLead } = await import('../lib/store.mjs');
+  const { insertRedemptionCode, findUnredeemedCodeForOffer } = await import('../lib/offers.mjs');
+  const db = getDb();
+
+  const offerId = 'OF-RESUME-TEST';
+  await db.execute({
+    sql: `INSERT INTO lead_magnet_offers
+          (id, name, item_description, retail_value_cents, week_start, week_end,
+           redemption_cap, redemptions_used, active, image_url, created_at)
+          VALUES (?, 'Free Silk Tie', 'A tie', 4500, '2099-01-01', '2099-12-31', 50, 0, 1, NULL, ?)`,
+    args: [offerId, new Date().toISOString()],
+  });
+
+  const email = 'resume@test.co';
+  const lead = await createLead(
+    { audience: 'general', firstName: 'Re', lastName: 'Sume', phone: '(470) 555-0001', email, consent: true },
+    newLeadId
+  );
+  await insertRedemptionCode({
+    code: 'GIFT-AAAAAA',
+    leadId: lead.lead.id,
+    offerId,
+    expiresAt: '2099-12-31T00:00:00.000Z',
+  });
+
+  // reserved → recoverable
+  const reserved = await findUnredeemedCodeForOffer(email, offerId);
+  assert.ok(reserved, 'reserved code should be found');
+  assert.equal(reserved.status, 'reserved');
+  assert.equal(reserved.code, 'GIFT-AAAAAA');
+  assert.equal(reserved.leadId, lead.lead.id);
+
+  // issued → still recoverable
+  await db.execute({ sql: `UPDATE redemption_codes SET status = 'issued' WHERE code = ?`, args: ['GIFT-AAAAAA'] });
+  const issued = await findUnredeemedCodeForOffer(email, offerId);
+  assert.ok(issued && issued.status === 'issued', 'issued code should be found');
+
+  // redeemed → not "unredeemed", must not be returned
+  await db.execute({ sql: `UPDATE redemption_codes SET status = 'redeemed' WHERE code = ?`, args: ['GIFT-AAAAAA'] });
+  assert.equal(await findUnredeemedCodeForOffer(email, offerId), null, 'redeemed code must not be returned');
+
+  // unknown email / unknown offer → null
+  assert.equal(await findUnredeemedCodeForOffer('nobody@test.co', offerId), null);
+  assert.equal(await findUnredeemedCodeForOffer(email, 'OF-NOPE'), null);
+});
+
+// =========================================================================
+console.log('\ncron.mjs runNurture email + SMS reminders');
+// =========================================================================
+
+// Runs before the concurrent-createBooking test below, which closes the
+// shared db client as its final cleanup (getDb() has no reset).
+await testAsync('runNurtureT1: sends email + SMS once each, idempotent per channel', async () => {
+  await migrate();
+  const { createBooking } = await import('../lib/store.mjs');
+  const db = getDb();
+
+  const savedDrySms = process.env.DRY_RUN_SMS;
+  process.env.DRY_RUN_SMS = 'true';
+  try {
+    // t1 targets bookings whose slot_date is tomorrow (UTC).
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const offerId = 'OF-NURTURE-SMS';
+    await db.execute({
+      sql: `INSERT INTO lead_magnet_offers
+            (id, name, item_description, retail_value_cents, week_start, week_end,
+             redemption_cap, redemptions_used, active, image_url, created_at)
+            VALUES (?, 'Free Silk Tie', 'A tie', 4500, '2000-01-01', '2099-12-31', 50, 0, 0, NULL, ?)`,
+      args: [offerId, new Date().toISOString()],
+    });
+
+    const mkBooking = async (i, time, { withCode = true } = {}) => {
+      const created = await createBooking(
+        {
+          audience: 'general',
+          customer: { firstName: `Nur${i}`, lastName: 'Ture', phone: '(470) 555-9876', email: `nurture${i}@test.co`, consent: true },
+          answers: {},
+          slot: { date: tomorrow, time, durationMinutes: 30, tz: 'America/New_York' },
+          consent: true,
+        },
+        newBookingId
+      );
+      assert.ok(created.ok, `test booking ${i} insert failed`);
+      if (withCode) {
+        await db.execute({
+          sql: `INSERT INTO redemption_codes
+                (code, lead_id, booking_id, offer_id, status, issued_at, expires_at, redeemed_at, redeemed_by_staff, created_at)
+                VALUES (?, 'LD-NURTURE', ?, ?, 'issued', ?, '2099-12-31T00:00:00.000Z', NULL, NULL, ?)`,
+          args: [`GIFT-NUR${i}00`, created.booking.id, offerId, new Date().toISOString(), new Date().toISOString()],
+        });
+      }
+      return created.booking.id;
+    };
+
+    const b1 = await mkBooking(1, '09:00');
+
+    // First run: both channels fire for the one candidate.
+    const run1 = await runNurtureT1();
+    assert.equal(run1.candidates, 1, `expected 1 candidate, got ${run1.candidates}`);
+    assert.equal(run1.sent, 1, `email sent=${run1.sent} failed=${run1.failed}`);
+    assert.equal(run1.smsSent, 1, `sms sent=${run1.smsSent} failed=${run1.smsFailed}`);
+
+    const sentRows = await db.execute({
+      sql: 'SELECT kind FROM nurture_sent WHERE booking_id = ? ORDER BY kind',
+      args: [b1],
+    });
+    assert.deepEqual(sentRows.rows.map((r) => r.kind), ['t1', 't1-sms']);
+
+    const rendered = await readFile('tmp/last-sms.txt', 'utf8');
+    assert.match(rendered, /To: \+14705559876/);
+    assert.match(rendered, /GIFT-NUR100/);
+    assert.match(rendered, /Reply STOP to opt out\./);
+
+    // Second run: fully sent → no candidates, nothing re-sent.
+    const run2 = await runNurtureT1();
+    assert.equal(run2.candidates, 0, 'already-sent booking must not be a candidate');
+
+    // Channel independence: email already recorded → only the SMS goes out.
+    const b2 = await mkBooking(2, '09:30');
+    await db.execute({
+      sql: `INSERT INTO nurture_sent (booking_id, kind, sent_at) VALUES (?, 't1', ?)`,
+      args: [b2, new Date().toISOString()],
+    });
+    const run3 = await runNurtureT1();
+    assert.equal(run3.candidates, 1);
+    assert.equal(run3.sent, 0, 'email must not re-send');
+    assert.equal(run3.smsSent, 1, 'sms must still send');
+
+    // Direct booking (no gift code) → generic reminder on both channels.
+    const b3 = await mkBooking(3, '10:05', { withCode: false });
+    const run4 = await runNurtureT1();
+    assert.equal(run4.candidates, 1, 'codeless booking must be a candidate');
+    assert.equal(run4.sent, 1, `generic email sent=${run4.sent} failed=${run4.failed}`);
+    assert.equal(run4.smsSent, 1, `generic sms sent=${run4.smsSent} failed=${run4.smsFailed}`);
+
+    const genericRows = await db.execute({
+      sql: 'SELECT kind FROM nurture_sent WHERE booking_id = ? ORDER BY kind',
+      args: [b3],
+    });
+    assert.deepEqual(genericRows.rows.map((r) => r.kind), ['t1', 't1-sms']);
+
+    const genericSms = await readFile('tmp/last-sms.txt', 'utf8');
+    assert.match(genericSms, /Nur3/);
+    assert.match(genericSms, /Reply STOP to opt out\./);
+    assert.ok(!genericSms.includes('GIFT-'), 'codeless sms must not mention a gift code');
+    assert.ok(!genericSms.includes('undefined'), 'codeless sms must not leak undefined');
+
+    const genericEmail = await readFile('tmp/last-email.html', 'utf8');
+    assert.match(genericEmail, /Nur3/);
+    assert.ok(!genericEmail.includes('GIFT-'), 'codeless email must not mention a gift code');
+    assert.ok(!genericEmail.includes('undefined'), 'codeless email must not leak undefined');
+  } finally {
+    if (savedDrySms === undefined) delete process.env.DRY_RUN_SMS;
+    else process.env.DRY_RUN_SMS = savedDrySms;
+  }
+});
+
+// =========================================================================
+console.log('\nstore.mjs concurrent createBooking');
+// =========================================================================
+
+await testAsync('createBooking: 50 concurrent writes at same slot, exactly one wins', async () => {
+  // Uses TURSO_DATABASE_URL from .env.test (defaults to file:test.db). The DB
+  // was already wiped + migrated by the findUnredeemedCodeForOffer test above;
+  // re-wiping here would move the file out from under the open connection
+  // (SQLITE_READONLY_DBMOVED). migrate() is idempotent, so just re-run it.
+  await migrate();
+
+  const { createBooking } = await import('../lib/store.mjs');
+  const db = getDb();
+
+  const make = (i) => ({
+    audience: 'weddings',
+    customer: { firstName: `F${i}`, lastName: 'Last', phone: '(470) 555-0000', email: `a${i}@b.co`, consent: true },
+    answers: {},
+    slot: { date: '2099-12-31', time: '10:00', durationMinutes: 30, tz: 'America/New_York' },
+    consent: true,
+  });
+
+  // 50 concurrent attempts at same slot — exactly one should succeed (UNIQUE constraint)
+  const same = await Promise.all(
+    Array.from({ length: 50 }, (_, i) => createBooking(make(i), newBookingId))
+  );
+  const sameWins = same.filter((r) => r.ok).length;
+  const sameFails = same.filter((r) => !r.ok && r.error === 'SLOT_TAKEN').length;
+  assert.equal(sameWins, 1, `expected 1 success, got ${sameWins}`);
+  assert.equal(sameFails, 49, `expected 49 SLOT_TAKEN, got ${sameFails}`);
+
+  // 50 concurrent attempts at distinct slots — all should succeed with unique ids
+  const distinct = await Promise.all(
+    Array.from({ length: 50 }, (_, i) =>
+      createBooking(
+        {
+          ...make(i),
+          slot: { date: '2099-12-30', time: `${String(10 + Math.floor(i / 10)).padStart(2, '0')}:${String((i % 10) * 5).padStart(2, '0')}`, durationMinutes: 30, tz: 'America/New_York' },
+        },
+        newBookingId
+      )
+    )
+  );
+  const okCount = distinct.filter((r) => r.ok).length;
+  assert.equal(okCount, 50, `expected 50 successful inserts, got ${okCount}`);
+  const ids = new Set(distinct.filter((r) => r.ok).map((r) => r.booking.id));
+  assert.equal(ids.size, 50, 'ids must be unique');
+
+  // Cleanup test DB
+  await db.close?.();
+  await rm('test.db', { force: true });
+  await rm('test.db-journal', { force: true });
+});
+
+// =========================================================================
+console.log('\naudiences.mjs');
+// =========================================================================
+
+test('all audiences expose at least 3 fields', () => {
+  for (const a of ['weddings', 'general']) {
+    const names = fieldNames(a);
+    assert.ok(names.length >= 3, `${a} has ${names.length}`);
+  }
+});
+
+// =========================================================================
+console.log('\nnotify-owner-booking.mjs');
+// =========================================================================
+
+const ownerBooking = {
+  id: 'BK-TEST-123',
+  audience: 'weddings',
+  slot: { date: '2026-08-15', time: '14:30', tz: 'America/New_York', durationMinutes: 30 },
+  customer: { firstName: 'Marcus', lastName: 'Webb', phone: '+14045551234', email: 'm@example.com' },
+  answers: { 'Party size': '5', 'Event date': '2026-09-20' },
+};
+
+test('ownerBookingSmsBody leads with name, phone, and human-readable slot', () => {
+  const body = ownerBookingSmsBody({
+    booking: ownerBooking,
+    audienceLabel: 'Wedding party fitting',
+    businessName: 'Suit Station',
+  });
+  assert.match(body, /NEW BOOKING/);
+  assert.match(body, /Wedding party fitting/);
+  assert.match(body, /Marcus Webb/);
+  assert.match(body, /\+14045551234/);
+  assert.match(body, /Saturday, August 15, 2026/);
+  assert.match(body, /2:30 PM/);
+  assert.match(body, /BK-TEST-123/);
+});
+
+test('ownerBookingSmsBody survives a booking with no answers and no phone', () => {
+  const bare = { ...ownerBooking, answers: {}, customer: { firstName: 'Ann', lastName: 'Lee' } };
+  const body = ownerBookingSmsBody({ booking: bare, audienceLabel: 'General fitting' });
+  assert.match(body, /Ann Lee/);
+  assert.match(body, /no phone/);
+  assert.ok(!body.includes('undefined'), 'body must not leak undefined');
+});
+
+// A single non-GSM-7 char (em dash, curly quote, ellipsis) forces UCS-2, which
+// cuts the segment size from 153 to 67 and adds a segment's cost to every alert.
+// Asserting on length alone cannot catch that — assert on the encoding itself.
+const GSM7 =
+  '@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡' +
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà^{}\\[~]|€';
+
+function smsSegments(body) {
+  const nonGsm = [...body].filter((c) => !GSM7.includes(c));
+  const perSegment = nonGsm.length > 0 ? 67 : 153;
+  return { segments: Math.ceil(body.length / perSegment), nonGsm };
+}
+
+test('ownerBookingSmsBody is GSM-7 clean (no UCS-2 downgrade)', () => {
+  const body = ownerBookingSmsBody({
+    booking: ownerBooking,
+    audienceLabel: 'Wedding party fitting',
+    businessName: 'Suit Station',
+  });
+  const { nonGsm } = smsSegments(body);
+  assert.deepEqual(nonGsm, [], `non-GSM-7 chars force UCS-2: ${JSON.stringify(nonGsm)}`);
+});
+
+test('ownerBookingSmsBody stays within two SMS segments, even with noisy answers', () => {
+  const noisy = {
+    ...ownerBooking,
+    answers: { Notes: 'x'.repeat(500), More: 'y'.repeat(500) },
+  };
+  const body = ownerBookingSmsBody({ booking: noisy, audienceLabel: 'Wedding party fitting' });
+  const { segments, nonGsm } = smsSegments(body);
+  assert.deepEqual(nonGsm, [], 'must stay GSM-7 even when answers are truncated');
+  assert.ok(segments <= 2, `body was ${body.length} chars = ${segments} segments`);
+});
+
+await testAsync('notifyOwnerOfBooking skips cleanly when OWNER_PHONE is unset', async () => {
+  const saved = process.env.OWNER_PHONE;
+  delete process.env.OWNER_PHONE;
+  const res = await notifyOwnerOfBooking(ownerBooking, 'Wedding party fitting');
+  if (saved !== undefined) process.env.OWNER_PHONE = saved;
+  assert.equal(res.ok, false);
+  assert.equal(res.skipped, true);
+});
+
+await testAsync('notifyOwnerOfBooking sends to OWNER_PHONE in dry-run mode', async () => {
+  const savedPhone = process.env.OWNER_PHONE;
+  const savedDry = process.env.DRY_RUN_SMS;
+  process.env.OWNER_PHONE = '7704468888';
+  process.env.DRY_RUN_SMS = 'true';
+  const res = await notifyOwnerOfBooking(ownerBooking, 'Wedding party fitting');
+  process.env.OWNER_PHONE = savedPhone;
+  process.env.DRY_RUN_SMS = savedDry;
+  assert.equal(res.ok, true, res.error);
+  assert.equal(res.dryRun, true);
+  const rendered = await readFile('tmp/last-sms.txt', 'utf8');
+  assert.match(rendered, /To: \+17704468888/);
+  assert.match(rendered, /Marcus Webb/);
+});
+
+// =========================================================================
+console.log('\nreminder-sms.mjs templates');
+// =========================================================================
+
+const reminderEnv = {
+  businessName: 'Suit Station',
+  businessAddress: '150 Pearl Nix Pkwy, Gainesville GA 30501',
+  businessPhone: '+14705957775',
+};
+const reminderBooking = {
+  id: 'BK-SMS-TEST',
+  audience: 'general',
+  customer: { firstName: 'Jonathan', lastName: 'Testerson', phone: '(470) 555-1234', email: 'j@x.co' },
+  slot: { date: '2099-05-15', time: '14:30', durationMinutes: 30, tz: 'America/New_York' },
+};
+const reminderOffer = { id: 'OF-X', name: 'Free Silk Tie', itemDescription: 'A tie' };
+const reminderArgs = { booking: reminderBooking, offer: reminderOffer, code: 'GIFT-ABC123', ...reminderEnv };
+
+for (const [name, builder] of [
+  ['nurtureT1Sms', nurtureT1Sms],
+  ['nurtureDayOfSms', nurtureDayOfSms],
+  ['nurtureT3Sms', nurtureT3Sms],
+]) {
+  test(`${name} (gift) names the business, time, code, and opt-out`, () => {
+    const body = builder(reminderArgs);
+    assert.match(body, /Suit Station/);
+    assert.match(body, /2:30 PM/);
+    assert.match(body, /GIFT-ABC123/);
+    assert.match(body, /Reply STOP to opt out\./);
+  });
+  test(`${name} (no code) drops the gift clause cleanly`, () => {
+    const body = builder({ ...reminderArgs, offer: null, code: null });
+    assert.match(body, /Suit Station/);
+    assert.match(body, /2:30 PM/);
+    assert.match(body, /Reply STOP to opt out\./);
+    assert.ok(!body.includes('GIFT-'), 'must not mention a gift code');
+    assert.ok(!body.includes('undefined'), 'must not leak undefined');
+  });
+  for (const [variant, args] of [['gift', reminderArgs], ['no code', { ...reminderArgs, offer: null, code: null }]]) {
+    test(`${name} (${variant}) is GSM-7 clean and within two segments`, () => {
+      const body = builder(args);
+      const { segments, nonGsm } = smsSegments(body);
+      assert.deepEqual(nonGsm, [], `non-GSM-7 chars force UCS-2: ${JSON.stringify(nonGsm)}`);
+      assert.ok(segments <= 2, `body was ${body.length} chars = ${segments} segments`);
+    });
+  }
+}
+
+test('reminder SMS bodies survive a missing first name', () => {
+  const anon = { ...reminderBooking, customer: { ...reminderBooking.customer, firstName: '' } };
+  const body = nurtureT1Sms({ ...reminderArgs, booking: anon });
+  assert.match(body, /Hi there,/);
+});
+
+// =========================================================================
+console.log('\nreminder-email.mjs generic templates');
+// =========================================================================
+
+for (const [name, builder] of [
+  ['reminderT3Email', reminderT3Email],
+  ['reminderT1Email', reminderT1Email],
+  ['reminderDayOfEmail', reminderDayOfEmail],
+]) {
+  test(`${name} renders subject, name, time, and address without a gift code`, () => {
+    const { subject, html, text } = builder({
+      booking: reminderBooking,
+      ...reminderEnv,
+      confirmUrl: 'https://example.com/booking-confirmed.html?id=BK-SMS-TEST',
+    });
+    assert.match(subject, /2:30 PM|visit/);
+    assert.match(html, /Jonathan/);
+    assert.match(html, /2:30 PM/);
+    assert.match(html, /150 Pearl Nix Pkwy/);
+    assert.match(text, /2:30 PM/);
+    for (const part of [subject, html, text]) {
+      assert.ok(!part.includes('undefined'), `${name} must not leak undefined`);
+      assert.ok(!part.includes('GIFT-'), `${name} must not mention a gift code`);
+    }
+  });
+}
+
+// =========================================================================
+console.log('\nvalidateAttribution (ads tracking)');
+// =========================================================================
+
+test('validateAttribution accepts a full valid record', () => {
+  const r = validateAttribution({
+    gclid: 'Cj0KCQjw_TEST-123.abc',
+    utm: { source: 'google', medium: 'cpc', campaign: 'suits' },
+    landingPage: '/suits?gclid=x',
+    referrer: 'https://www.google.com/',
+  });
+  assert.equal(r.gclid, 'Cj0KCQjw_TEST-123.abc');
+  assert.equal(JSON.parse(r.utmJson).source, 'google');
+  assert.equal(r.landingPage, '/suits?gclid=x');
+});
+
+test('validateAttribution drops malformed click ids, keeps the rest', () => {
+  const r = validateAttribution({ gclid: 'has spaces!', utm: { source: 'google' } });
+  assert.equal(r.gclid, null);
+  assert.equal(JSON.parse(r.utmJson).source, 'google');
+});
+
+test('validateAttribution trims oversized fields and strips control chars', () => {
+  const r = validateAttribution({ referrer: 'x'.repeat(1000), utm: { source: 'goo gle' } });
+  assert.equal(r.referrer.length, 500);
+  assert.equal(JSON.parse(r.utmJson).source, 'google');
+});
+
+test('validateAttribution returns null for garbage / empty input', () => {
+  assert.equal(validateAttribution('nope'), null);
+  assert.equal(validateAttribution(null), null);
+  assert.equal(validateAttribution([1, 2]), null);
+  assert.equal(validateAttribution({ gclid: '!!!', utm: { bogus: 'x' } }), null);
+});
+
+// =========================================================================
+console.log('\nads-feed.mjs');
+// =========================================================================
+
+test('formatConversionTime is DST-safe (EDT vs EST wall clock)', () => {
+  // 18:00 UTC in May = 14:00 EDT; 18:00 UTC in Feb = 13:00 EST.
+  assert.equal(formatConversionTime('2026-05-08T18:00:00.000Z'), '2026-05-08 14:00:00');
+  assert.equal(formatConversionTime('2026-02-08T18:00:00.000Z'), '2026-02-08 13:00:00');
+  assert.equal(formatConversionTime('not-a-date'), null);
+});
+
+test('buildAdsCsv emits Parameters row, header, and formatted values with CRLF', () => {
+  const csv = buildAdsCsv([
+    { gclid: 'TESTCLICK1', amountCents: 41200, recordedAt: '2026-05-08T18:00:00.000Z' },
+    { gclid: 'TESTCLICK2', amountCents: 0, recordedAt: '2026-05-08T18:00:00.000Z' },   // dropped
+    { gclid: null, amountCents: 5000, recordedAt: '2026-05-08T18:00:00.000Z' },        // dropped
+  ]);
+  const lines = csv.split('\r\n');
+  assert.equal(lines[0], 'Parameters:TimeZone=America/New_York,,,,');
+  assert.equal(lines[1], 'Google Click ID,Conversion Name,Conversion Time,Conversion Value,Conversion Currency');
+  assert.equal(lines[2], 'TESTCLICK1,store_sale,2026-05-08 14:00:00,412.00,USD');
+  assert.equal(lines.length, 4, 'zero-amount and gclid-less rows must be excluded');
+});
+
+test('buildAdsCsv with no rows still returns both header rows', () => {
+  const lines = buildAdsCsv([]).split('\r\n');
+  assert.equal(lines.length, 3);
+  assert.ok(lines[0].startsWith('Parameters:TimeZone='));
+});
+
+// =========================================================================
+console.log('\nsales-store.mjs (booking sales, walk-ins, ad spend, revenue stats)');
+// =========================================================================
+
+await testAsync('sales pipeline: record sale (write-once time), conversion rows, spend, revenue stats', async () => {
+  // Deleting the DB file here would kill the shared libsql client
+  // (CLIENT_CLOSED) — truncate via SQL instead so counts start from zero.
+  await migrate();
+  const db = getDb();
+  for (const table of ['bookings', 'ad_spend']) {
+    await db.execute(`DELETE FROM ${table}`);
+  }
+
+  const { createBooking, updateBookingStaffStatus, findBookingById } = await import('../lib/store.mjs');
+  const {
+    recordBookingSale, upsertAdSpend, listAdSpend, listConversionRows, getRevenueStats,
+  } = await import('../lib/sales-store.mjs');
+  const { newBookingId } = await import('../lib/id.mjs');
+
+  const mkBooking = (slotTime, extra = {}) => createBooking({
+    audience: 'general',
+    customer: { firstName: 'T', lastName: 'S', phone: '(470) 595-7775', email: 't@s.co', consent: true },
+    answers: {},
+    slot: { date: '2026-06-10', time: slotTime, durationMinutes: 30, tz: 'America/New_York' },
+    consent: true,
+    ...extra,
+  }, newBookingId);
+
+  // Attributed booking, closed with a $412 sale.
+  const b1 = (await mkBooking('10:00', { gclid: 'TESTCLICK_A' })).booking;
+  await updateBookingStaffStatus(b1.id, 'closed');
+  const r1 = await recordBookingSale(b1.id, { amountCents: 41200, notes: 'navy suit' });
+  assert.equal(r1.ok, true);
+
+  // sale_recorded_at is write-once: editing the amount must not move it.
+  const firstStamp = (await findBookingById(b1.id)).saleRecordedAt;
+  await new Promise((r) => setTimeout(r, 5));
+  await recordBookingSale(b1.id, { amountCents: 45000 });
+  const after = await findBookingById(b1.id);
+  assert.equal(after.saleAmountCents, 45000);
+  assert.equal(after.saleRecordedAt, firstStamp, 'sale_recorded_at must never shift on edit');
+
+  // Organic $150 sale + showed-but-didn't-buy + $0 no-buy.
+  const b2 = (await mkBooking('11:00')).booking;
+  await recordBookingSale(b2.id, { amountCents: 15000 });
+  const b3 = (await mkBooking('12:00')).booking;
+  await updateBookingStaffStatus(b3.id, 'showed');
+  const b4 = (await mkBooking('13:00')).booking;
+  await recordBookingSale(b4.id, { amountCents: 0 });
+  // The retired 'completed' value is no longer assignable.
+  assert.equal((await updateBookingStaffStatus(b4.id, 'completed')).error, 'INVALID_STATUS');
+
+  // Amount validation.
+  assert.equal((await recordBookingSale(b2.id, { amountCents: -5 })).error, 'INVALID_AMOUNT');
+  assert.equal((await recordBookingSale(b2.id, { amountCents: 1.5 })).error, 'INVALID_AMOUNT');
+  assert.equal((await recordBookingSale('BK-DEADBEEF', { amountCents: 100 })).error, 'NOT_FOUND');
+
+  // Conversion feed rows: only gclid + amount>0.
+  const conv = await listConversionRows();
+  assert.equal(conv.length, 1);
+  assert.equal(conv[0].gclid, 'TESTCLICK_A');
+  assert.equal(conv[0].amountCents, 45000);
+
+  // Ad spend upsert is idempotent per month. Spend goes on the appointment
+  // month (June) so CAC can compute against June's customers.
+  const thisMonth = new Date().toISOString().slice(0, 7);
+  await upsertAdSpend('2026-06', 100000);
+  await upsertAdSpend('2026-06', 120000);
+  assert.equal((await upsertAdSpend('2026-13', 1)).error, 'INVALID_MONTH');
+  const spend = await listAdSpend();
+  assert.equal(spend.length, 1);
+  assert.equal(spend[0].amountCents, 120000);
+
+  // Revenue stats — everything customer-facing groups by APPOINTMENT month
+  // (slot_date = June), even though the sales were recorded "today". Only
+  // bookingsCreated follows created_at (this month).
+  const stats = await getRevenueStats(24);
+  const cur = stats.find((m) => m.month === thisMonth);
+  const june = stats.find((m) => m.month === '2026-06');
+  assert.equal(cur.bookingsCreated, 4);
+  assert.equal(cur.gclidBookings, 1);
+  assert.equal(june.showed, 2, 'showed + closed, by appointment month');
+  assert.equal(june.customers, 2, 'b1 ($450) and b2 ($150); the $0 no-buy is not a customer');
+  assert.equal(june.revenueCents, 60000);
+  assert.equal(june.aovCents, 30000);
+  assert.equal(june.cacCents, 60000, 'CAC = spend / customers = 120000 / 2');
+});
+
+// =========================================================================
+console.log('\nhandlers.mjs handleAdminCreateBooking (staff manual entry)');
+// =========================================================================
+
+// Minimal req/res doubles matching the (req, res) handler convention.
+function fakeReq(body, { auth = true } = {}) {
+  return {
+    method: 'POST',
+    url: '/api/admin/booking-create',
+    headers: auth ? { authorization: `Bearer ${process.env.STAFF_TOKEN}` } : {},
+    socket: { remoteAddress: '127.0.0.1' },
+    body,
+  };
+}
+
+function fakeRes() {
+  const out = { status: 0, body: null, headers: {} };
+  return {
+    out,
+    setHeader(name, value) { out.headers[String(name).toLowerCase()] = value; },
+    writeHead(status) { out.status = status; },
+    end(payload) { out.body = payload ? JSON.parse(payload) : null; },
+  };
+}
+
+await testAsync('booking-create: rejects a request with no staff auth', async () => {
+  const { handleAdminCreateBooking } = await import('../lib/handlers.mjs');
+  const res = fakeRes();
+  await handleAdminCreateBooking(fakeReq({}, { auth: false }), res);
+  assert.equal(res.out.status, 401);
+  assert.equal(res.out.body.error, 'UNAUTHORIZED');
+});
+
+await testAsync('booking-create: 400 on missing phone / unknown audience', async () => {
+  const { handleAdminCreateBooking } = await import('../lib/handlers.mjs');
+  const res = fakeRes();
+  await handleAdminCreateBooking(
+    fakeReq({ audience: 'gala', firstName: 'A', lastName: 'B', slotDate: '2026-08-01', slotTime: '12:00' }),
+    res
+  );
+  assert.equal(res.out.status, 400);
+  assert.match(res.out.body.error, /audience/i);
+  assert.match(res.out.body.error, /phone/i);
+});
+
+await testAsync('booking-create: saves a phone booking with no email, status new, off-grid slot', async () => {
+  const { handleAdminCreateBooking } = await import('../lib/handlers.mjs');
+  const { findBookingById } = await import('../lib/store.mjs');
+  const res = fakeRes();
+  await handleAdminCreateBooking(
+    fakeReq({
+      audience: 'weddings',
+      firstName: 'Adrian',
+      lastName: 'Allison',
+      phone: '706-308-6143',
+      slotDate: '2026-07-25',
+      slotTime: '12:00', // not on the public 30+5min grid — staff entries skip the grid check
+      answers: { priorities: 'Booked over the phone.' },
+    }),
+    res
+  );
+  assert.equal(res.out.status, 200, JSON.stringify(res.out.body));
+  const saved = await findBookingById(res.out.body.data.id);
+  assert.equal(saved.customer.firstName, 'Adrian');
+  assert.equal(saved.customer.lastName, 'Allison');
+  assert.equal(saved.customer.phone, '(706) 308-6143');
+  assert.equal(saved.customer.email, '');
+  assert.equal(saved.staffStatus, 'new');
+  assert.equal(saved.emailStatus, 'skipped');
+  assert.equal(saved.answers.priorities, 'Booked over the phone.');
+});
+
+await testAsync('booking-create: 409 SLOT_TAKEN on double-book, 400 on bad email', async () => {
+  const { handleAdminCreateBooking } = await import('../lib/handlers.mjs');
+  const dupe = fakeRes();
+  await handleAdminCreateBooking(
+    fakeReq({
+      audience: 'general',
+      firstName: 'Someone',
+      lastName: 'Else',
+      phone: '4045550123',
+      slotDate: '2026-07-25',
+      slotTime: '12:00',
+    }),
+    dupe
+  );
+  assert.equal(dupe.out.status, 409);
+  assert.equal(dupe.out.body.error, 'SLOT_TAKEN');
+
+  const badEmail = fakeRes();
+  await handleAdminCreateBooking(
+    fakeReq({
+      audience: 'general',
+      firstName: 'Someone',
+      lastName: 'Else',
+      phone: '4045550123',
+      email: 'not-an-email',
+      slotDate: '2026-07-25',
+      slotTime: '13:00',
+    }),
+    badEmail
+  );
+  assert.equal(badEmail.out.status, 400);
+  assert.match(badEmail.out.body.error, /email/i);
+});
+
+// =========================================================================
+console.log('\ngoogle-ads.mjs + ad-spend sync');
+// =========================================================================
+
+const googleAds = await import('../lib/google-ads.mjs');
+
+const ADS_ENV = [
+  'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN',
+  'GOOGLE_ADS_DEVELOPER_TOKEN', 'GOOGLE_ADS_CUSTOMER_ID', 'GOOGLE_ADS_LOGIN_CUSTOMER_ID',
+];
+
+/* Must await `fn` before restoring: the code under test reads process.env
+   after its first await, so a synchronous finally would tear the env down
+   mid-call and the assertion would be testing the wrong thing. */
+async function withAdsEnv(values, fn) {
+  const saved = Object.fromEntries(ADS_ENV.map((k) => [k, process.env[k]]));
+  try {
+    for (const k of ADS_ENV) delete process.env[k];
+    for (const [k, v] of Object.entries(values)) process.env[k] = v;
+    googleAds.resetTokenCache();
+    return await fn();
+  } finally {
+    for (const k of ADS_ENV) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    googleAds.resetTokenCache();
+  }
+}
+
+const FULL_ADS_ENV = {
+  GOOGLE_ADS_CLIENT_ID: 'cid.apps.googleusercontent.com',
+  GOOGLE_ADS_CLIENT_SECRET: 'secret',
+  GOOGLE_ADS_REFRESH_TOKEN: 'refresh',
+  GOOGLE_ADS_DEVELOPER_TOKEN: 'devtoken',
+  GOOGLE_ADS_CUSTOMER_ID: '532-289-6656',
+};
+
+test('microsToCents converts and rounds', () => {
+  assert.equal(googleAds.microsToCents(0), 0);
+  assert.equal(googleAds.microsToCents(1_000_000), 100);      // $1.00
+  assert.equal(googleAds.microsToCents(418_440_000), 41844);  // $418.44
+  assert.equal(googleAds.microsToCents(15_000), 2, 'rounds to the nearer cent');
+  assert.equal(googleAds.microsToCents(undefined), 0);
+});
+
+await testAsync('isConfigured requires every credential; customer id is normalized', async () => {
+  await withAdsEnv(FULL_ADS_ENV, () => {
+    assert.equal(googleAds.isConfigured(), true);
+    assert.equal(googleAds.readConfig().customerId, '5322896656', 'dashes stripped');
+  });
+  await withAdsEnv({ ...FULL_ADS_ENV, GOOGLE_ADS_REFRESH_TOKEN: '' }, () => {
+    assert.equal(googleAds.isConfigured(), false);
+  });
+  await withAdsEnv({}, () => assert.equal(googleAds.isConfigured(), false));
+});
+
+await testAsync('fetchMonthlySpend: NOT_CONFIGURED without credentials, no network call', async () => {
+  const realFetch = globalThis.fetch;
+  let called = 0;
+  globalThis.fetch = async () => { called++; throw new Error('should not be called'); };
+  try {
+    const res = await withAdsEnv({}, () => googleAds.fetchMonthlySpend());
+    assert.deepEqual(res, { ok: false, error: 'NOT_CONFIGURED' });
+    assert.equal(called, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await testAsync('fetchMonthlySpend: aggregates daily rows into months', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url: String(url), opts });
+    if (String(url).includes('oauth2.googleapis.com')) {
+      return new Response(JSON.stringify({ access_token: 'at-123', expires_in: 3600 }), { status: 200 });
+    }
+    // searchStream answers with an ARRAY of chunks, each holding results.
+    return new Response(JSON.stringify([
+      { results: [
+        { segments: { date: '2026-06-29' }, metrics: { costMicros: '10000000' } },  // $10
+        { segments: { date: '2026-06-30' }, metrics: { costMicros: '5500000' } },   // $5.50
+      ] },
+      { results: [
+        { segments: { date: '2026-07-01' }, metrics: { costMicros: '20000000' } },  // $20
+        { segments: { date: '2026-07-02' }, metrics: {} },                          // no cost key
+      ] },
+    ]), { status: 200 });
+  };
+  try {
+    const res = await withAdsEnv(FULL_ADS_ENV, () => googleAds.fetchMonthlySpend({ months: 3 }));
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.months, [
+      { month: '2026-07', amountCents: 2000 },
+      { month: '2026-06', amountCents: 1550 },
+    ], 'newest first, summed per month');
+
+    const adsCall = seen.find((s) => s.url.includes('googleads.googleapis.com'));
+    assert.match(adsCall.url, /\/customers\/5322896656\/googleAds:searchStream$/);
+    assert.equal(adsCall.opts.headers['developer-token'], 'devtoken');
+    assert.equal(adsCall.opts.headers.authorization, 'Bearer at-123');
+    assert.equal(
+      adsCall.opts.headers['login-customer-id'], undefined,
+      'header omitted when no manager account is configured'
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await testAsync('fetchMonthlySpend: surfaces a rejected refresh token', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 });
+  try {
+    const res = await withAdsEnv(FULL_ADS_ENV, () => googleAds.fetchMonthlySpend());
+    assert.deepEqual(res, { ok: false, error: 'REFRESH_TOKEN_REJECTED' });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await testAsync('fetchMonthlySpend: reports an API error status', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('oauth2')) {
+      return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 });
+    }
+    return new Response('{"error":{"message":"PERMISSION_DENIED"}}', { status: 403 });
+  };
+  try {
+    const res = await withAdsEnv(FULL_ADS_ENV, () => googleAds.fetchMonthlySpend());
+    assert.deepEqual(res, { ok: false, error: 'API_403' });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await testAsync('syncAdSpendMonths: writes auto months, never overwrites a manual one', async () => {
+  await migrate();
+  const db = getDb();
+  await db.execute('DELETE FROM ad_spend');
+
+  const { upsertAdSpend, listAdSpend, syncAdSpendMonths, releaseAdSpendToAuto } =
+    await import('../lib/sales-store.mjs');
+
+  // Owner typed May by hand; April came from a previous sync.
+  await upsertAdSpend('2026-05', 11700, { source: 'manual' });
+  await upsertAdSpend('2026-04', 25871, { source: 'auto' });
+
+  const first = await syncAdSpendMonths([
+    { month: '2026-05', amountCents: 31512 },   // manual → must be skipped
+    { month: '2026-04', amountCents: 25871 },   // same figure → unchanged
+    { month: '2026-06', amountCents: 36599 },   // brand new → written
+  ]);
+  assert.deepEqual(first.skipped, ['2026-05']);
+  assert.deepEqual(first.unchanged, ['2026-04']);
+  assert.deepEqual(first.updated, ['2026-06']);
+
+  const rows = Object.fromEntries((await listAdSpend()).map((r) => [r.month, r]));
+  assert.equal(rows['2026-05'].amountCents, 11700, 'hand-typed figure survived the sync');
+  assert.equal(rows['2026-05'].source, 'manual');
+  assert.equal(rows['2026-05'].syncedAt, null);
+  assert.equal(rows['2026-06'].amountCents, 36599);
+  assert.equal(rows['2026-06'].source, 'auto');
+  assert.ok(rows['2026-06'].syncedAt, 'auto rows carry a sync timestamp');
+  assert.ok(rows['2026-04'].syncedAt, 'unchanged auto rows still restamp synced_at');
+
+  // Releasing the pin lets the next sync correct it.
+  assert.equal((await releaseAdSpendToAuto('2026-05')).ok, true);
+  const second = await syncAdSpendMonths([{ month: '2026-05', amountCents: 31512 }]);
+  assert.deepEqual(second.updated, ['2026-05']);
+  const after = (await listAdSpend()).find((r) => r.month === '2026-05');
+  assert.equal(after.amountCents, 31512);
+  assert.equal(after.source, 'auto');
+
+  assert.equal((await releaseAdSpendToAuto('nope')).error, 'INVALID_MONTH');
+});
+
+await testAsync('syncAdSpendMonths: ignores malformed rows', async () => {
+  await migrate();
+  const db = getDb();
+  await db.execute('DELETE FROM ad_spend');
+  const { syncAdSpendMonths, listAdSpend } = await import('../lib/sales-store.mjs');
+
+  const result = await syncAdSpendMonths([
+    { month: '2026-13', amountCents: 100 },
+    { month: 'garbage', amountCents: 100 },
+    { month: '2026-08', amountCents: -5 },
+    { month: '2026-08', amountCents: 4200 },
+    null,
+  ]);
+  assert.deepEqual(result.updated, ['2026-08']);
+  assert.equal((await listAdSpend()).length, 1);
+});
+
+await testAsync('runSyncAdSpend: skips cleanly when Google Ads is not configured', async () => {
+  const { runSyncAdSpend } = await import('../lib/cron.mjs');
+  const res = await withAdsEnv({}, () => runSyncAdSpend());
+  assert.deepEqual(res, { ok: false, error: 'NOT_CONFIGURED' });
+});
+
+await testAsync('sync endpoint: 503 unconfigured, 200 with a real result payload', async () => {
+  const { handleAdminSyncAdSpend } = await import('../lib/handlers-sales.mjs');
+
+  const unconfigured = fakeRes();
+  await withAdsEnv({}, () => handleAdminSyncAdSpend(fakeReq({}), unconfigured));
+  assert.equal(unconfigured.out.status, 503);
+  assert.equal(unconfigured.out.body.error, 'NOT_CONFIGURED');
+
+  // An empty `skipped` array must NOT read as a failure.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('oauth2')) {
+      return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 });
+    }
+    return new Response(JSON.stringify([
+      { results: [{ segments: { date: '2026-09-01' }, metrics: { costMicros: '1000000' } }] },
+    ]), { status: 200 });
+  };
+  try {
+    const okRes = fakeRes();
+    await withAdsEnv(FULL_ADS_ENV, () => handleAdminSyncAdSpend(fakeReq({}), okRes));
+    assert.equal(okRes.out.status, 200);
+    assert.equal(okRes.out.body.ok, true);
+    assert.deepEqual(okRes.out.body.skipped, []);
+    assert.deepEqual(okRes.out.body.updated, ['2026-09']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await testAsync('sync endpoint: requires staff auth', async () => {
+  const { handleAdminSyncAdSpend } = await import('../lib/handlers-sales.mjs');
+  const res = fakeRes();
+  await handleAdminSyncAdSpend(fakeReq({}, { auth: false }), res);
+  assert.equal(res.out.status, 401);
+});
+
+// =========================================================================
+console.log('\nstaff-auth.mjs (password login + session cookie)');
+// =========================================================================
+
+const staffAuth = await import('../lib/staff-auth.mjs');
+const staffAuthHandlers = await import('../lib/handlers-staff-auth.mjs');
+
+function authReq({ cookie, authorization, body } = {}) {
+  const headers = {};
+  if (cookie) headers.cookie = cookie;
+  if (authorization) headers.authorization = authorization;
+  return {
+    method: 'POST',
+    url: '/api/admin/login',
+    headers,
+    socket: { remoteAddress: '10.0.0.1' },
+    body,
+  };
+}
+
+test('verifyStaffPassword: exact match only', () => {
+  assert.equal(staffAuth.verifyStaffPassword(process.env.STAFF_PASSWORD), true);
+  assert.equal(staffAuth.verifyStaffPassword('wrong-password'), false);
+  assert.equal(staffAuth.verifyStaffPassword(''), false);
+  assert.equal(staffAuth.verifyStaffPassword(undefined), false);
+  assert.equal(staffAuth.verifyStaffPassword(process.env.STAFF_PASSWORD + 'x'), false);
+});
+
+test('verifyStaffPassword: refuses when STAFF_PASSWORD is unset or too short', () => {
+  const real = process.env.STAFF_PASSWORD;
+  try {
+    delete process.env.STAFF_PASSWORD;
+    assert.equal(staffAuth.isPasswordConfigured(), false);
+    assert.equal(staffAuth.verifyStaffPassword(''), false);
+    process.env.STAFF_PASSWORD = 'abc';
+    assert.equal(staffAuth.isPasswordConfigured(), false, '3 chars is below the minimum');
+    assert.equal(staffAuth.verifyStaffPassword('abc'), false);
+  } finally {
+    process.env.STAFF_PASSWORD = real;
+  }
+});
+
+test('session value: round-trips, expires, and rejects tampering', () => {
+  const now = Date.UTC(2026, 6, 20);
+  const value = staffAuth.createSessionValue(now);
+  assert.match(value, /^\d+\.[0-9a-f]{64}$/);
+  assert.equal(staffAuth.verifySessionValue(value, now + 1000), true);
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  assert.equal(staffAuth.verifySessionValue(value, now + (staffAuth.SESSION_DAYS - 1) * dayMs), true);
+  assert.equal(staffAuth.verifySessionValue(value, now + (staffAuth.SESSION_DAYS + 1) * dayMs), false, 'expired');
+
+  const [exp, sig] = value.split('.');
+  assert.equal(staffAuth.verifySessionValue(`${exp}.${sig.slice(0, -1)}0`, now), false, 'bad signature');
+  assert.equal(staffAuth.verifySessionValue(`${Number(exp) + dayMs}.${sig}`, now), false, 'extended expiry');
+  assert.equal(staffAuth.verifySessionValue(exp, now), false, 'no signature');
+  assert.equal(staffAuth.verifySessionValue('', now), false);
+});
+
+test('session value: a different signing key invalidates existing cookies', () => {
+  const now = Date.UTC(2026, 6, 20);
+  const value = staffAuth.createSessionValue(now);
+  const realToken = process.env.STAFF_TOKEN;
+  try {
+    process.env.STAFF_TOKEN = 'a-completely-different-key-32-chars-long';
+    assert.equal(staffAuth.verifySessionValue(value, now), false);
+  } finally {
+    process.env.STAFF_TOKEN = realToken;
+  }
+  assert.equal(staffAuth.verifySessionValue(value, now), true, 'valid again once the key is restored');
+});
+
+test('readCookie: picks the right cookie out of a header', () => {
+  const req = { headers: { cookie: 'other=1; gasw_staff=abc.def; another=2' } };
+  assert.equal(staffAuth.readCookie(req), 'abc.def');
+  assert.equal(staffAuth.readCookie({ headers: {} }), '');
+  assert.equal(staffAuth.readCookie({ headers: { cookie: 'nope=1' } }), '');
+});
+
+test('isStaffAuthed: cookie OR bearer token, nothing else', () => {
+  const value = staffAuth.createSessionValue();
+  assert.equal(staffAuth.isStaffAuthed(authReq({ cookie: `gasw_staff=${value}` })), true);
+  assert.equal(
+    staffAuth.isStaffAuthed(authReq({ authorization: `Bearer ${process.env.STAFF_TOKEN}` })),
+    true
+  );
+  assert.equal(staffAuth.isStaffAuthed(authReq({})), false);
+  assert.equal(staffAuth.isStaffAuthed(authReq({ authorization: 'Bearer nope' })), false);
+  assert.equal(staffAuth.isStaffAuthed(authReq({ cookie: 'gasw_staff=forged.value' })), false);
+});
+
+await testAsync('login: wrong password 401s, right password sets an HttpOnly cookie', async () => {
+  staffAuth.resetLoginRateLimit();
+
+  const bad = fakeRes();
+  await staffAuthHandlers.handleStaffLogin(authReq({ body: { password: 'not-it' } }), bad);
+  assert.equal(bad.out.status, 401);
+  assert.equal(bad.out.body.error, 'BAD_PASSWORD');
+  assert.equal(bad.out.headers['set-cookie'], undefined, 'no cookie on a failed login');
+
+  const good = fakeRes();
+  await staffAuthHandlers.handleStaffLogin(
+    authReq({ body: { password: process.env.STAFF_PASSWORD } }),
+    good
+  );
+  assert.equal(good.out.status, 200);
+  assert.equal(good.out.body.authed, true);
+  const cookie = good.out.headers['set-cookie'];
+  assert.match(cookie, /^gasw_staff=\d+\.[0-9a-f]{64};/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\//);
+
+  const value = cookie.slice('gasw_staff='.length, cookie.indexOf(';'));
+  assert.equal(staffAuth.verifySessionValue(value), true, 'the issued cookie verifies');
+});
+
+await testAsync('login: 429 after too many wrong guesses from one IP', async () => {
+  staffAuth.resetLoginRateLimit();
+  for (let i = 0; i < 10; i++) {
+    await staffAuthHandlers.handleStaffLogin(authReq({ body: { password: `guess-${i}` } }), fakeRes());
+  }
+  const blocked = fakeRes();
+  await staffAuthHandlers.handleStaffLogin(authReq({ body: { password: 'guess-11' } }), blocked);
+  assert.equal(blocked.out.status, 429);
+  assert.equal(blocked.out.body.error, 'TOO_MANY_ATTEMPTS');
+  assert.ok(blocked.out.body.retryAfterSec > 0);
+
+  // Even the correct password is refused while the window is open.
+  const correct = fakeRes();
+  await staffAuthHandlers.handleStaffLogin(
+    authReq({ body: { password: process.env.STAFF_PASSWORD } }),
+    correct
+  );
+  assert.equal(correct.out.status, 429);
+  staffAuth.resetLoginRateLimit();
+});
+
+await testAsync('login: 503 when STAFF_PASSWORD is not configured', async () => {
+  staffAuth.resetLoginRateLimit();
+  const real = process.env.STAFF_PASSWORD;
+  try {
+    delete process.env.STAFF_PASSWORD;
+    const res = fakeRes();
+    await staffAuthHandlers.handleStaffLogin(authReq({ body: { password: 'anything' } }), res);
+    assert.equal(res.out.status, 503);
+    assert.equal(res.out.body.error, 'PASSWORD_NOT_CONFIGURED');
+  } finally {
+    process.env.STAFF_PASSWORD = real;
+  }
+});
+
+await testAsync('logout clears the cookie; session reports auth state', async () => {
+  const out = fakeRes();
+  await staffAuthHandlers.handleStaffLogout(authReq({}), out);
+  assert.equal(out.out.status, 200);
+  assert.match(out.out.headers['set-cookie'], /^gasw_staff=; .*Max-Age=0/);
+
+  const anon = fakeRes();
+  await staffAuthHandlers.handleStaffSession(authReq({}), anon);
+  assert.deepEqual(anon.out.body, { ok: true, authed: false, configured: true });
+
+  const authed = fakeRes();
+  await staffAuthHandlers.handleStaffSession(
+    authReq({ cookie: `gasw_staff=${staffAuth.createSessionValue()}` }),
+    authed
+  );
+  assert.equal(authed.out.body.authed, true);
+});
+
+await testAsync('a guarded admin handler accepts the session cookie', async () => {
+  const { handleAdminCreateBooking } = await import('../lib/handlers.mjs');
+  const req = fakeReq({}, { auth: false });
+  req.headers.cookie = `gasw_staff=${staffAuth.createSessionValue()}`;
+  const res = fakeRes();
+  await handleAdminCreateBooking(req, res);
+  assert.equal(res.out.status, 400, 'reaches validation, so auth passed');
+  assert.notEqual(res.out.body.error, 'UNAUTHORIZED');
+});
+
+// =========================================================================
+console.log('\n— results —');
+console.log(results.join('\n'));
+console.log(`\n${passed} passed, ${failed} failed\n`);
+process.exit(failed === 0 ? 0 : 1);

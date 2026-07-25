@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Staff · Customer Intakes</title>
+  <meta name="robots" content="noindex,nofollow" />
+  <link rel="icon" type="image/png" href="/assets/img/favicon.png" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0E1729;
+      color: #fff;
+      min-height: 100vh;
+      padding: 24px 20px 80px;
+    }
+    main { max-width: 1280px; margin: 0 auto; }
+
+    header.page {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+    .subtitle { color: #9CA3AF; font-size: 14px; margin: 0 0 24px; }
+
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .btn {
+      padding: 9px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 4px;
+      border: 1px solid #2A3654;
+      background: #1F2D4F;
+      color: #fff;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover { border-color: #C9A961; }
+    .btn-primary { background: #C9A961; color: #0E1729; border-color: #C9A961; }
+    .btn-primary:hover { background: #D4B775; }
+
+    .alert { padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+    .alert.error { background: #4A1E1B; color: #FBE9E7; }
+    .alert.success { background: #1B3A2A; color: #DFF5E8; }
+
+    /* Filter bar */
+    .filterbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 16px;
+      padding: 14px;
+      background: #1F2D4F;
+      border: 1px solid #2A3654;
+      border-radius: 4px;
+    }
+    .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+    .pill-btn {
+      padding: 7px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 999px;
+      border: 1px solid #2A3654;
+      background: transparent;
+      color: #9CA3AF;
+      cursor: pointer;
+    }
+    .pill-btn:hover { color: #fff; }
+    .pill-btn.is-active { background: #C9A961; color: #0E1729; border-color: #C9A961; }
+    .filterbar .search {
+      flex: 1;
+      min-width: 200px;
+      padding: 9px 14px;
+      font-size: 14px;
+      background: #0E1729;
+      color: #fff;
+      border: 1px solid #2A3654;
+      border-radius: 4px;
+    }
+    .filterbar .count { color: #9CA3AF; font-size: 13px; }
+
+    /* Table */
+    .table-wrap { border: 1px solid #2A3654; border-radius: 4px; background: #14213D; }
+    table { width: 100%; border-collapse: collapse; min-width: 920px; }
+    thead th {
+      background: #1F2D4F;
+      color: #9CA3AF;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      text-align: left;
+      padding: 12px 14px;
+      border-bottom: 1px solid #2A3654;
+      white-space: nowrap;
+    }
+    tbody td {
+      padding: 14px;
+      border-bottom: 1px solid #1F2D4F;
+      vertical-align: top;
+      font-size: 14px;
+    }
+    tbody tr:hover { background: #1F2D4F; }
+    tbody tr.is-urgent td:first-child { border-left: 3px solid #C9A961; padding-left: 11px; }
+    tbody tr.is-overdue td:first-child { border-left: 3px solid #FF6B6B; padding-left: 11px; }
+
+    .customer { display: flex; flex-direction: column; gap: 2px; }
+    .customer .name { font-weight: 700; color: #fff; }
+    .customer .name-link { display: inline-block; cursor: pointer; text-decoration: none; color: inherit; }
+    .customer .name-link:hover { color: #C9A961; }
+    .customer .id { font-family: 'Courier New', monospace; font-size: 11px; color: #6B7280; }
+    .contact { display: flex; flex-direction: column; gap: 4px; }
+    .contact a { color: #C9A961; text-decoration: none; font-size: 13px; }
+    .contact a:hover { text-decoration: underline; }
+    .suit { display: flex; flex-direction: column; gap: 2px; }
+    .suit .size { font-weight: 700; }
+    .suit .color { color: #9CA3AF; font-size: 13px; }
+    .notes { color: #E5E7EB; font-size: 13px; line-height: 1.4; max-width: 280px; white-space: pre-wrap; }
+    .notes-extra { color: #9CA3AF; font-size: 12px; line-height: 1.4; max-width: 280px; white-space: pre-wrap; margin-top: 4px; font-style: italic; }
+    .ticket-num { font-family: 'Courier New', monospace; font-size: 14px; color: #C9A961; font-weight: 700; }
+    .ticket-num.empty { color: #4B5563; font-weight: 400; }
+    .date-cell .primary { font-weight: 700; }
+    .date-cell .relative { color: #9CA3AF; font-size: 12px; margin-top: 2px; }
+    .date-cell .relative.urgent { color: #C9A961; }
+    .date-cell .relative.overdue { color: #FF6B6B; }
+
+    .status-select {
+      background: #0E1729;
+      color: #fff;
+      border: 1px solid #2A3654;
+      border-radius: 4px;
+      padding: 7px 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      min-width: 130px;
+    }
+    .status-select.s-pending { color: #FBBF24; border-color: #6B5A18; }
+    .status-select.s-sent { color: #93C5FD; border-color: #1E40AF; }
+    .status-select.s-back { color: #6EE7B7; border-color: #064E3B; }
+    .status-select.s-picked_up { color: #9CA3AF; border-color: #2A3654; }
+
+    .btn-notify {
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      border-radius: 4px;
+      border: 1px solid #C9A961;
+      background: #C9A961;
+      color: #0E1729;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-notify:hover:not(:disabled) { background: #D4B775; border-color: #D4B775; }
+    .btn-notify:disabled { opacity: 0.6; cursor: wait; }
+    .notice-sent {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: #6EE7B7;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .notify-na { color: #4B5563; font-size: 13px; }
+
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: #9CA3AF;
+    }
+    .empty .big { font-size: 18px; color: #fff; margin-bottom: 8px; }
+
+    /* --- View tabs ------------------------------------------------------ */
+    .view-tabs {
+      display: flex;
+      gap: 4px;
+      margin: 0 0 16px;
+      border-bottom: 1px solid #2A3654;
+    }
+    .view-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 11px 18px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #9CA3AF;
+      background: transparent;
+      border: none;
+      border-bottom: 3px solid transparent;
+      cursor: pointer;
+      margin-bottom: -1px;
+      letter-spacing: 0.01em;
+    }
+    .view-tab:hover { color: #fff; }
+    .view-tab.is-active {
+      color: #C9A961;
+      border-bottom-color: #C9A961;
+    }
+    /* Red "new appointments" priority badge on the Appointments tab. */
+    .tab-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      background: #FF6B6B;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .tab-badge[hidden] { display: none; }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .panel-header h2 { margin: 0; font-size: 16px; font-weight: 600; color: #fff; }
+    .panel-header .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* Special-orders specific cells */
+    .so-item { display: flex; flex-direction: column; gap: 2px; }
+    .so-item .type {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #C9A961;
+    }
+    .so-item .specs { font-weight: 600; color: #fff; }
+    .so-item .specs .muted { color: #9CA3AF; font-weight: 400; }
+    .so-empty-cell { color: #4B5563; font-size: 13px; }
+
+    .status-select.s-ordered { color: #93C5FD; border-color: #1E40AF; }
+    .status-select.s-arrived { color: #6EE7B7; border-color: #064E3B; }
+
+    /* --- Appointments view --------------------------------------------- */
+    .status-select.s-new       { color: #FF6B6B; border-color: #4A1E1B; }
+    .status-select.s-confirmed { color: #93C5FD; border-color: #1E40AF; }
+    .status-select.s-showed    { color: #93C5FD; border-color: #1E40AF; }
+    .status-select.s-closed    { color: #6EE7B7; border-color: #064E3B; }
+    .status-select.s-completed { color: #6EE7B7; border-color: #064E3B; } /* legacy */
+    .status-select.s-no_show   { color: #FBBF24; border-color: #6B5A18; }
+    .status-select.s-cancelled { color: #9CA3AF; border-color: #2A3654; }
+
+    /* --- Sale column ----------------------------------------------------- */
+    .sale-chip {
+      display: inline-block; padding: 3px 10px; border-radius: 999px;
+      font-size: 13px; font-weight: 700; cursor: pointer;
+      border: 1px solid #2A3654; color: #9CA3AF; background: transparent;
+    }
+    .sale-chip:hover { border-color: #C9A961; color: #C9A961; }
+    .sale-chip.has-sale { color: #6EE7B7; border-color: #064E3B; }
+    .sale-chip.no-sale { color: #FBBF24; border-color: #6B5A18; }
+    tbody tr.is-new td:first-child { border-left: 3px solid #FF6B6B; padding-left: 11px; }
+    .appt-type {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #C9A961;
+    }
+    .appt-details { display: flex; flex-direction: column; gap: 3px; max-width: 280px; }
+    .appt-details .row { font-size: 13px; color: #E5E7EB; line-height: 1.4; }
+    .appt-details .row .k { color: #9CA3AF; }
+    .appt-details .none { color: #4B5563; font-size: 13px; }
+    .edit-modal__answers { display: flex; flex-direction: column; gap: 14px; }
+    .edit-modal__answers:empty { display: none; }
+
+    /* --- Edit modal ----------------------------------------------------- */
+    .edit-modal { position: fixed; inset: 0; z-index: 9999; }
+    .edit-modal[hidden] { display: none; }
+    .edit-modal__overlay {
+      position: absolute; inset: 0;
+      background: rgba(8, 13, 26, 0.78);
+      opacity: 0; transition: opacity 180ms ease;
+    }
+    .edit-modal__card {
+      position: relative;
+      max-width: 600px;
+      margin: 4vh auto;
+      background: #14213D;
+      color: #fff;
+      border: 1px solid #2A3654;
+      border-radius: 6px;
+      padding: 0;
+      max-height: 92vh;
+      display: flex;
+      flex-direction: column;
+      opacity: 0; transform: translateY(12px);
+      transition: opacity 200ms ease, transform 200ms ease;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+    }
+    .edit-modal.is-open .edit-modal__overlay { opacity: 1; }
+    .edit-modal.is-open .edit-modal__card { opacity: 1; transform: translateY(0); }
+    .edit-modal__header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid #2A3654;
+    }
+    .edit-modal__header h2 { margin: 0; font-size: 17px; font-weight: 700; }
+    .edit-modal__close {
+      background: transparent; border: none; color: #9CA3AF;
+      font-size: 24px; line-height: 1; cursor: pointer; padding: 4px 8px;
+    }
+    .edit-modal__close:hover { color: #fff; }
+    .edit-modal__form {
+      display: flex; flex-direction: column; gap: 14px;
+      padding: 20px; overflow-y: auto;
+    }
+    .edit-modal__form label {
+      display: flex; flex-direction: column; gap: 4px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+      text-transform: uppercase; color: #C9A961;
+    }
+    .edit-modal__form input,
+    .edit-modal__form textarea,
+    .edit-modal__form select {
+      width: 100%;
+      padding: 10px 12px;
+      font-family: inherit; font-size: 14px;
+      background: #0E1729;
+      color: #fff;
+      border: 1px solid #2A3654;
+      border-radius: 4px;
+      letter-spacing: normal; text-transform: none;
+    }
+    .edit-modal__form textarea { resize: vertical; min-height: 150px; line-height: 1.5; }
+    .edit-modal__form input:focus,
+    .edit-modal__form textarea:focus,
+    .edit-modal__form select:focus {
+      outline: none; border-color: #C9A961;
+    }
+    .edit-modal__hint {
+      font-size: 12px;
+      color: #9CA3AF;
+      font-weight: 400;
+      letter-spacing: normal;
+      text-transform: none;
+      margin-top: -8px;
+    }
+    .edit-modal__row { display: flex; gap: 12px; }
+    .edit-modal__row > label { flex: 1; }
+    .edit-modal__chips-wrap { display: flex; flex-direction: column; gap: 8px; }
+    .edit-modal__chips-wrap .chip-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+      text-transform: uppercase; color: #C9A961;
+    }
+    .edit-modal__chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .edit-chip {
+      padding: 6px 12px;
+      font-size: 13px; font-weight: 600;
+      border-radius: 999px;
+      border: 1px solid #2A3654;
+      background: transparent;
+      color: #9CA3AF;
+      cursor: pointer;
+    }
+    .edit-chip:hover { color: #fff; }
+    .edit-chip.is-active { background: #C9A961; color: #0E1729; border-color: #C9A961; }
+    .edit-modal__error {
+      background: #4A1E1B; color: #FBE9E7;
+      padding: 10px 12px; border-radius: 4px; font-size: 13px;
+    }
+    .edit-modal__footer {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 12px;
+      padding: 16px 20px;
+      border-top: 1px solid #2A3654;
+      background: #0E1729;
+      border-radius: 0 0 6px 6px;
+    }
+    .edit-modal__actions { display: flex; gap: 8px; }
+    .btn-delete {
+      padding: 9px 14px; font-size: 13px; font-weight: 600;
+      background: transparent; color: #FF6B6B;
+      border: 1px solid #4A1E1B; border-radius: 4px; cursor: pointer;
+    }
+    .btn-delete:hover { background: #4A1E1B; border-color: #FF6B6B; }
+    .btn-cancel {
+      padding: 9px 14px; font-size: 13px; font-weight: 600;
+      background: transparent; color: #9CA3AF;
+      border: 1px solid #2A3654; border-radius: 4px; cursor: pointer;
+    }
+    .btn-cancel:hover { color: #fff; }
+    .btn-save {
+      padding: 9px 16px; font-size: 13px; font-weight: 700;
+      background: #C9A961; color: #0E1729;
+      border: 1px solid #C9A961; border-radius: 4px; cursor: pointer;
+    }
+    .btn-save:hover:not(:disabled) { background: #D4B775; border-color: #D4B775; }
+    .btn-save:disabled { opacity: 0.6; cursor: wait; }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="page">
+      <div>
+        <h1>Customer Intakes</h1>
+        <p class="subtitle">In-store tailoring intakes — sorted by need-by date.</p>
+      </div>
+      <div class="actions" data-region="actions">
+        <button class="btn" data-action="refresh">↻ Refresh</button>
+        <button class="btn" data-action="download-csv">Download CSV</button>
+        <a class="btn" href="/staff/redeem.html">Redeem</a>
+        <a class="btn" href="/staff/stats.html">Stats</a>
+        <a class="btn" href="/intake/">Open intake form ↗</a>
+      </div>
+    </header>
+
+    <div class="alert error" data-region="alert" hidden></div>
+
+    <nav class="view-tabs" data-region="view-tabs" role="tablist" aria-label="Dashboard view">
+      <button class="view-tab is-active" data-view="intakes" role="tab" aria-selected="true">Tailoring Intakes</button>
+      <button class="view-tab" data-view="special-orders" role="tab" aria-selected="false">Special Orders</button>
+      <button class="view-tab" data-view="appointments" role="tab" aria-selected="false">
+        Appointments
+        <span class="tab-badge" data-region="appt-badge" hidden aria-label="new appointments"></span>
+      </button>
+    </nav>
+
+    <section data-view-panel="intakes" data-region="dashboard">
+      <div class="filterbar">
+        <div class="pills" data-region="status-pills">
+          <button class="pill-btn is-active" data-status="pending">Pending</button>
+          <button class="pill-btn" data-status="sent">Sent to tailor</button>
+          <button class="pill-btn" data-status="back">Back from tailor</button>
+          <button class="pill-btn" data-status="picked_up">Picked up</button>
+          <button class="pill-btn" data-status="all">All</button>
+        </div>
+        <input class="search" data-region="search" placeholder="Search name, phone, or email…" />
+        <span class="count" data-region="count">—</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th>Ticket #</th>
+              <th>Contact</th>
+              <th>Tailoring</th>
+              <th>Need by</th>
+              <th>Status</th>
+              <th>Notify</th>
+              <th>Submitted</th>
+            </tr>
+          </thead>
+          <tbody data-region="rows"></tbody>
+        </table>
+      </div>
+      <div class="empty" data-region="empty" hidden>
+        <div class="big">No intakes match these filters</div>
+        <div>Try switching to "All" or clearing the search box.</div>
+      </div>
+    </section>
+
+    <section data-view-panel="special-orders" hidden>
+      <div class="panel-header">
+        <h2>Items being special-ordered for customers</h2>
+        <div class="panel-actions">
+          <button class="btn btn-primary" data-action="so-new">+ New special order</button>
+          <button class="btn" data-action="so-refresh">↻ Refresh</button>
+          <button class="btn" data-action="so-download-csv">Download CSV</button>
+        </div>
+      </div>
+
+      <div class="filterbar">
+        <div class="pills" data-region="so-status-pills">
+          <button class="pill-btn is-active" data-so-status="pending">Pending</button>
+          <button class="pill-btn" data-so-status="ordered">Ordered</button>
+          <button class="pill-btn" data-so-status="arrived">Arrived</button>
+          <button class="pill-btn" data-so-status="picked_up">Picked up</button>
+          <button class="pill-btn" data-so-status="all">All</button>
+        </div>
+        <input class="search" data-region="so-search" placeholder="Search name, phone, email, item…" />
+        <span class="count" data-region="so-count">—</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th>Item</th>
+              <th>Contact</th>
+              <th>Notes</th>
+              <th>Need by</th>
+              <th>Status</th>
+              <th>Notify</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody data-region="so-rows"></tbody>
+        </table>
+      </div>
+      <div class="empty" data-region="so-empty" hidden>
+        <div class="big">No special orders match these filters</div>
+        <div>Click "+ New special order" to log one, or switch to "All".</div>
+      </div>
+    </section>
+
+    <section data-view-panel="appointments" hidden>
+      <div class="panel-header">
+        <h2>Styling-session &amp; fitting appointments booked online</h2>
+        <div class="panel-actions">
+          <button class="btn" data-action="appt-refresh">↻ Refresh</button>
+          <button class="btn" data-action="appt-download-csv">Download CSV</button>
+        </div>
+      </div>
+
+      <div class="filterbar">
+        <div class="pills" data-region="appt-status-pills">
+          <button class="pill-btn is-active" data-appt-status="new">Booked</button>
+          <button class="pill-btn" data-appt-status="no_show">No-show</button>
+          <button class="pill-btn" data-appt-status="showed">Showed</button>
+          <button class="pill-btn" data-appt-status="closed">Closed</button>
+          <button class="pill-btn" data-appt-status="all">All</button>
+        </div>
+        <input class="search" data-region="appt-search" placeholder="Search name, phone, or email…" />
+        <span class="count" data-region="appt-count">—</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th>Contact</th>
+              <th>Type</th>
+              <th>Date &amp; Time</th>
+              <th>Details</th>
+              <th>Status</th>
+              <th>Sale</th>
+              <th>Booked</th>
+            </tr>
+          </thead>
+          <tbody data-region="appt-rows"></tbody>
+        </table>
+      </div>
+      <div class="empty" data-region="appt-empty" hidden>
+        <div class="big">No appointments match these filters</div>
+        <div>Try switching to "All" or clearing the search box.</div>
+      </div>
+    </section>
+
+    <div class="edit-modal" data-region="so-modal" hidden>
+      <div class="edit-modal__overlay" data-action="so-close-modal"></div>
+      <div class="edit-modal__card" role="dialog" aria-modal="true" aria-labelledby="so-modal-title">
+        <header class="edit-modal__header">
+          <h2 id="so-modal-title" data-region="so-modal-title">New special order</h2>
+          <button type="button" class="edit-modal__close" data-action="so-close-modal" aria-label="Close">×</button>
+        </header>
+        <form class="edit-modal__form" data-region="so-modal-form" novalidate>
+          <input type="hidden" name="id" />
+          <div class="edit-modal__hint">All customer fields are optional — fill in whatever you have. At least one is required.</div>
+          <div class="edit-modal__row">
+            <label>First name<input type="text" name="firstName" maxlength="60" /></label>
+            <label>Last name<input type="text" name="lastName" maxlength="60" /></label>
+          </div>
+          <div class="edit-modal__row">
+            <label>Phone<input type="tel" name="phone" maxlength="14" inputmode="tel" /></label>
+            <label>Email<input type="email" name="email" maxlength="254" /></label>
+          </div>
+          <label>Item type
+            <select name="itemType" required>
+              <option value="suit">Suit</option>
+              <option value="shirt">Shirt</option>
+              <option value="shoes">Shoes</option>
+              <option value="accessory">Accessory (tie, belt, suspenders…)</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <div class="edit-modal__row">
+            <label>Color<input type="text" name="color" maxlength="60" placeholder="e.g. navy" /></label>
+            <label>Size<input type="text" name="size" maxlength="32" placeholder="e.g. 42R" /></label>
+          </div>
+          <label>Description / brand / style
+            <textarea name="description" rows="3" maxlength="500" placeholder="e.g. Calvin Klein, slim-fit, charcoal pinstripe" style="min-height:80px;"></textarea>
+          </label>
+          <label>Need by (optional)<input type="date" name="needByDate" /></label>
+          <label>Additional notes<textarea name="additionalNotes" rows="6" maxlength="500"></textarea></label>
+          <div class="edit-modal__error" data-region="so-modal-error" hidden></div>
+        </form>
+        <footer class="edit-modal__footer">
+          <button type="button" class="btn-delete" data-action="so-delete" data-region="so-delete-btn" hidden>Delete</button>
+          <div class="edit-modal__actions">
+            <button type="button" class="btn-cancel" data-action="so-close-modal">Cancel</button>
+            <button type="button" class="btn-save" data-action="so-save" data-region="so-save-btn">Save</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <div class="edit-modal" data-region="edit-modal" hidden>
+      <div class="edit-modal__overlay" data-action="close-edit-modal"></div>
+      <div class="edit-modal__card" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+        <header class="edit-modal__header">
+          <h2 id="edit-modal-title">Edit intake</h2>
+          <button type="button" class="edit-modal__close" data-action="close-edit-modal" aria-label="Close">×</button>
+        </header>
+        <form class="edit-modal__form" data-region="edit-modal-form" novalidate>
+          <input type="hidden" name="id" />
+          <div class="edit-modal__row">
+            <label>First name<input type="text" name="firstName" required maxlength="60" /></label>
+            <label>Last name<input type="text" name="lastName" required maxlength="60" /></label>
+          </div>
+          <label>Phone<input type="tel" name="phone" required maxlength="14" /></label>
+          <label>Email<input type="email" name="email" required maxlength="254" /></label>
+          <label>Ticket number<input type="text" name="ticketNumber" maxlength="32" /></label>
+          <div class="edit-modal__chips-wrap">
+            <span class="chip-label">What needs tailoring?</span>
+            <div class="edit-modal__chips" data-region="edit-modal-chips"></div>
+          </div>
+          <label>Need by<input type="date" name="needByDate" required /></label>
+          <label>Additional notes<textarea name="additionalNotes" rows="6" maxlength="500"></textarea></label>
+          <div class="edit-modal__error" data-region="edit-modal-error" hidden></div>
+        </form>
+        <footer class="edit-modal__footer">
+          <button type="button" class="btn-delete" data-action="delete-intake">Delete</button>
+          <div class="edit-modal__actions">
+            <button type="button" class="btn-cancel" data-action="close-edit-modal">Cancel</button>
+            <button type="button" class="btn-save" data-action="save-edit-modal">Save changes</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <div class="edit-modal" data-region="sale-modal" hidden>
+      <div class="edit-modal__overlay" data-action="sale-close-modal"></div>
+      <div class="edit-modal__card" role="dialog" aria-modal="true" aria-labelledby="sale-modal-title">
+        <header class="edit-modal__header">
+          <h2 id="sale-modal-title" data-region="sale-modal-title">Record sale</h2>
+          <button type="button" class="edit-modal__close" data-action="sale-close-modal" aria-label="Close">×</button>
+        </header>
+        <form class="edit-modal__form" data-region="sale-modal-form" novalidate>
+          <input type="hidden" name="id" />
+          <label>Amount ($)<input type="number" name="amount" min="0" max="50000" step="0.01" inputmode="decimal" placeholder="e.g. 412.50" /></label>
+          <label>Notes (optional)<textarea name="notes" rows="3" maxlength="500" placeholder="e.g. navy suit + alterations" style="min-height:70px;"></textarea></label>
+          <div class="edit-modal__error" data-region="sale-modal-error" hidden></div>
+        </form>
+        <footer class="edit-modal__footer">
+          <div></div>
+          <div class="edit-modal__actions">
+            <button type="button" class="btn-cancel" data-action="sale-close-modal">Cancel</button>
+            <button type="button" class="btn-save" data-action="sale-save" data-region="sale-save-btn">Save sale</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <div class="edit-modal" data-region="appt-modal" hidden>
+      <div class="edit-modal__overlay" data-action="appt-close-modal"></div>
+      <div class="edit-modal__card" role="dialog" aria-modal="true" aria-labelledby="appt-modal-title">
+        <header class="edit-modal__header">
+          <h2 id="appt-modal-title" data-region="appt-modal-title">Edit appointment</h2>
+          <button type="button" class="edit-modal__close" data-action="appt-close-modal" aria-label="Close">×</button>
+        </header>
+        <form class="edit-modal__form" data-region="appt-modal-form" novalidate>
+          <input type="hidden" name="id" />
+          <div class="edit-modal__hint" data-region="appt-modal-type"></div>
+          <div class="edit-modal__row">
+            <label>First name<input type="text" name="firstName" required maxlength="60" /></label>
+            <label>Last name<input type="text" name="lastName" required maxlength="60" /></label>
+          </div>
+          <label>Phone<input type="tel" name="phone" required maxlength="14" /></label>
+          <label>Email<input type="email" name="email" required maxlength="254" /></label>
+          <div class="edit-modal__row">
+            <label>Appointment date<input type="date" name="slotDate" required /></label>
+            <label>Appointment time<input type="time" name="slotTime" required /></label>
+          </div>
+          <div class="edit-modal__answers" data-region="appt-modal-answers"></div>
+          <div class="edit-modal__error" data-region="appt-modal-error" hidden></div>
+        </form>
+        <footer class="edit-modal__footer">
+          <button type="button" class="btn-delete" data-action="appt-delete">Delete</button>
+          <div class="edit-modal__actions">
+            <button type="button" class="btn-cancel" data-action="appt-close-modal">Cancel</button>
+            <button type="button" class="btn-save" data-action="appt-save" data-region="appt-save-btn">Save changes</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  </main>
+
+  <script src="/assets/js/staff.js" defer></script>
+  <script src="/assets/js/staff-intakes.js" defer></script>
+  <script src="/assets/js/staff-special-orders.js" defer></script>
+  <script src="/assets/js/staff-appointments.js" defer></script>
+</body>
+</html>

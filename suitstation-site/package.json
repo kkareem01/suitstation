@@ -1,0 +1,19 @@
+{
+  "name": "suitstation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "start": "node --env-file=.env server.mjs",
+    "dev": "node --env-file=.env server.mjs",
+    "migrate": "node --env-file=.env scripts/migrate.mjs",
+    "test": "node --env-file=.env.test tests/run.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.15.0",
+    "@vercel/analytics": "^2.0.1"
+  }
+}
