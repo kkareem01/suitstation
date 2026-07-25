@@ -1,38 +1,66 @@
-# --- OS / editor cruft ---
-.DS_Store
-**/.DS_Store
-*.log
-
-# --- Secrets: never commit real env files (any level) ---
 .env
 .env.local
 .env.test
 .env.*.local
-**/.env
-**/.env.local
-**/.env.test
-**/.env.*.local
-*_recovery_code.txt
-**/tools/ads/google-ads.yaml
 
-# --- Dependencies ---
-node_modules/
-**/node_modules/
+data/bookings.json
+data/leads.json
+data/*.tmp
 
-# --- Local databases ---
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
-local.db*
-test.db*
-
-# --- Build / deploy ---
-.vercel/
-**/.vercel/
 tmp/
-**/tmp/
+*.log
+.DS_Store
+node_modules/
 
-# --- Local Claude config ---
+# Local SQLite database (used by `file:` connection string in dev)
+local.db
+local.db-journal
+local.db-shm
+local.db-wal
+test.db
+test.db-journal
+test.db-shm
+test.db-wal
+
+# Vercel
+.vercel/
+
+# Claude Code local config
 .claude/
-**/.claude/
+
+# VSL drafts and source assets — local working files, not part of the site
+/VSL Scripts.md
+/VSL template.txt
+/VSL Video With Hyperframes Editor/
+
+# Local-only reference / inspiration material — not part of the site.
+# Leading slash = root-only match. Without it, "Reviews/" would also match
+# "assets/reviews/" on case-insensitive filesystems (macOS default).
+/Reviews/
+*.pdf
+*inspo*.png
+Screenshot*.png
+Review Structure example.png
+Review structure example number two.png
+front end design on mobile for booking.png
+www.acquisition.com_o-vegas*.png
+bestofhall county logo.jpg
+CLAUDE copy.md
+favicon copy.ico
+favicon copy.png
+
+# High-res originals of review screenshots — only the optimized .png variants
+# are referenced by the site, the .original.png files would just bloat the repo.
+assets/reviews/*.original.png
+.vercel
+
+# Secrets / recovery codes — never commit.
+twilio_2FA_recovery_code.txt
+*_recovery_code.txt
+
+# Local audit notes — not part of the site.
+/SCHEMA-AUDIT.md
+
+# Google Ads API tool (credentials + venv never committed)
+tools/ads/.venv/
+tools/ads/google-ads.yaml
