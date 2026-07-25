@@ -59,12 +59,14 @@
     /* --- Header / brand --- */
     .brand { text-align: center; margin-bottom: 34px; }
 
-    .brand__logo {
-      width: 168px;
-      max-width: 62vw;
-      height: auto;
-      display: block;
-      margin: 0 auto 18px;
+    .brand__name {
+      font-family: var(--font-display);
+      font-weight: 600;
+      font-size: clamp(48px, 14vw, 72px);
+      line-height: 1.0;
+      letter-spacing: 0.005em;
+      color: var(--paper);
+      margin: 0 auto 20px;
     }
 
     .brand__rule {
@@ -174,7 +176,7 @@
 <body>
   <main class="card">
     <div class="brand">
-      <img class="brand__logo" src="/assets/img/logo-suitstation-reverse.png" alt="Suit Station" />
+      <h1 class="brand__name">Suit Station</h1>
       <hr class="brand__rule" />
       <p class="brand__tag">Gainesville, Georgia</p>
       <p class="brand__loc">150 Pearl Nix Pkwy &middot; Open 7 days</p>
